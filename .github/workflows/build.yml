@@ -103,6 +103,10 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
 
               <application
                   android:allowBackup="true"
@@ -111,9 +115,16 @@ jobs:
                   android:roundIcon="@mipmap/ic_launcher_round"
                   android:label="@string/app_name"
                   android:theme="@style/Theme.App">
+
+                  <service
+                      android:name=".ConvertService"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+
                   <activity
                       android:name=".MainActivity"
-                      android:exported="true">
+                      android:exported="true"
+                      android:launchMode="singleTop">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -122,42 +133,373 @@ jobs:
               </application>
           </manifest>
           EOF_5
-          mkdir -p "$(dirname "app/src/main/java/com/example/ytmp3/MainActivity.kt")"
-          cat > "app/src/main/java/com/example/ytmp3/MainActivity.kt" <<'EOF_6'
+          mkdir -p "$(dirname "app/src/main/java/com/example/ytmp3/ConvertService.kt")"
+          cat > "app/src/main/java/com/example/ytmp3/ConvertService.kt" <<'EOF_6'
           package com.example.ytmp3
 
-          import android.content.ClipboardManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
           import android.content.ContentValues
-          import android.graphics.BitmapFactory
-          import android.os.Bundle
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
           import android.os.Environment
+          import android.os.IBinder
+          import android.os.PowerManager
           import android.provider.MediaStore
-          import android.view.View
-          import android.widget.Button
-          import android.widget.EditText
-          import android.widget.ImageView
-          import android.widget.ProgressBar
-          import android.widget.TextView
-          import androidx.appcompat.app.AppCompatActivity
-          import androidx.appcompat.widget.SwitchCompat
+          import androidx.core.app.NotificationCompat
           import com.yausername.ffmpeg.FFmpeg
           import com.yausername.youtubedl_android.YoutubeDL
           import com.yausername.youtubedl_android.YoutubeDLRequest
           import java.io.File
+
+          class ConvertService : Service() {
+
+              companion object {
+                  const val EXTRA_URL = "url"
+                  const val EXTRA_PLAYLIST = "playlist"
+                  const val ACTION_STOP = "com.example.ytmp3.STOP"
+                  const val CHANNEL = "convert"
+                  const val NOTIF_ID = 1
+                  const val DONE_NOTIF_ID = 2
+                  const val PROCESS_ID = "tdg_convert"
+                  @Volatile var working = false
+              }
+
+              @Volatile private var cancelled = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      cancelled = true
+                      try {
+                          YoutubeDL.getInstance().destroyProcessById(PROCESS_ID)
+                      } catch (e: Throwable) {
+                          // nu e nimic de oprit
+                      }
+                      if (!working) {
+                          JobState.running = false
+                          JobState.changed()
+                          stopSelf()
+                      }
+                      return START_NOT_STICKY
+                  }
+
+                  createChannel()
+                  startForeground(
+                      NOTIF_ID,
+                      buildNotif("Se pornește...", 0, true),
+                      ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                  )
+
+                  val url = intent?.getStringExtra(EXTRA_URL)
+                  if (url == null || working) {
+                      if (!working) stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  val playlist = intent.getBooleanExtra(EXTRA_PLAYLIST, false)
+                  cancelled = false
+                  working = true
+                  Thread { runJob(url, playlist) }.start()
+                  return START_NOT_STICKY
+              }
+
+              private fun createChannel() {
+                  val ch = NotificationChannel(CHANNEL, "Conversii", NotificationManager.IMPORTANCE_LOW)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+              }
+
+              private fun openIntent(): PendingIntent {
+                  val i = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                  return PendingIntent.getActivity(this, 0, i, PendingIntent.FLAG_IMMUTABLE)
+              }
+
+              private fun buildNotif(text: String, pct: Int, indeterminate: Boolean): Notification {
+                  val stop = PendingIntent.getService(
+                      this, 1,
+                      Intent(this, ConvertService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return NotificationCompat.Builder(this, CHANNEL)
+                      .setSmallIcon(R.drawable.ic_notif)
+                      .setContentTitle("TDG YT2MP3 CONVERT  " + pct + "%")
+                      .setContentText(text)
+                      .setContentIntent(openIntent())
+                      .setOngoing(true)
+                      .setOnlyAlertOnce(true)
+                      .setProgress(100, pct, indeterminate)
+                      .addAction(0, "OPREȘTE", stop)
+                      .build()
+              }
+
+              private fun notifyDone(text: String) {
+                  val n = NotificationCompat.Builder(this, CHANNEL)
+                      .setSmallIcon(R.drawable.ic_notif)
+                      .setContentTitle("TDG YT2MP3 CONVERT")
+                      .setContentText(text)
+                      .setContentIntent(openIntent())
+                      .setAutoCancel(true)
+                      .build()
+                  getSystemService(NotificationManager::class.java).notify(DONE_NOTIF_ID, n)
+              }
+
+              // Anunță interfața și actualizează notificarea.
+              private fun push() {
+                  JobState.changed()
+                  val list = JobState.items
+                  val idx = JobState.current
+                  val text = if (idx in list.indices) {
+                      "" + (idx + 1) + "/" + list.size + " · " + list[idx].title
+                  } else {
+                      JobState.message
+                  }
+                  val pct = JobState.overallPercent()
+                  getSystemService(NotificationManager::class.java)
+                      .notify(NOTIF_ID, buildNotif(text, pct, list.isEmpty()))
+              }
+
+              private fun runJob(url: String, playlist: Boolean) {
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ytmp3:job")
+                  wl.acquire(6 * 60 * 60 * 1000L)
+                  val dir = File(cacheDir, "dl")
+                  var saved = 0
+                  var failed = 0
+                  var finalMsg = ""
+                  try {
+                      YoutubeDL.getInstance().init(application)
+                      FFmpeg.getInstance().init(application)
+
+                      JobState.items = emptyList()
+                      JobState.current = -1
+                      JobState.message = "Se citește lista..."
+                      push()
+
+                      val list = fetchList(url, playlist)
+                      if (cancelled) throw Exception("Oprit")
+                      if (list.isEmpty()) throw Exception("Nu am găsit nicio melodie la acest link")
+
+                      JobState.items = list
+                      JobState.message = "Se descarcă " + list.size + " melodie(i)..."
+                      push()
+
+                      for ((index, item) in list.withIndex()) {
+                          if (cancelled) break
+                          JobState.current = index
+                          item.state = SongItem.DOWNLOADING
+                          item.percent = 0
+                          push()
+                          try {
+                              dir.deleteRecursively()
+                              dir.mkdirs()
+                              downloadOne(item, dir)
+                              item.state = SongItem.DONE
+                              item.percent = 100
+                              saved++
+                          } catch (e: Exception) {
+                              if (cancelled) {
+                                  item.state = SongItem.WAITING
+                                  item.percent = 0
+                                  break
+                              }
+                              item.state = SongItem.ERROR
+                              failed++
+                          }
+                          push()
+                      }
+
+                      finalMsg = when {
+                          cancelled -> "Oprit. Salvate: $saved"
+                          failed > 0 -> "Gata: $saved salvate, $failed eșuate"
+                          else -> "Gata: $saved salvate în Music/YT2MP3"
+                      }
+                  } catch (e: Exception) {
+                      finalMsg = "Eroare: " + e.message
+                  } finally {
+                      JobState.message = finalMsg
+                      JobState.running = false
+                      working = false
+                      JobState.changed()
+                      dir.deleteRecursively()
+                      if (wl.isHeld) wl.release()
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      notifyDone(finalMsg)
+                      stopSelf()
+                  }
+              }
+
+              // Citește lista completă (id + titlu) fără să descarce nimic.
+              private fun fetchList(url: String, playlist: Boolean): List<SongItem> {
+                  val req = YoutubeDLRequest(url)
+                  req.addOption(if (playlist) "--yes-playlist" else "--no-playlist")
+                  req.addOption("--flat-playlist")
+                  req.addOption("-i")
+                  req.addOption("--print", "%(id)s|%(title)s")
+                  val out = YoutubeDL.getInstance().execute(req, PROCESS_ID) { _, _, _ -> }.out
+                  val idRegex = Regex("^[A-Za-z0-9_-]{11}$")
+                  val result = ArrayList<SongItem>()
+                  for (raw in out.split("\n")) {
+                      val line = raw.trim()
+                      if (line.indexOf('|') != 11) continue
+                      val id = line.substring(0, 11)
+                      if (!idRegex.matches(id)) continue
+                      val title = line.substring(12).trim().ifEmpty { id }
+                      result.add(SongItem(id, title))
+                  }
+                  return result
+              }
+
+              private fun downloadOne(item: SongItem, dir: File) {
+                  val req = YoutubeDLRequest("https://www.youtube.com/watch?v=" + item.id)
+                  req.addOption("--no-playlist")
+                  req.addOption("-f", "bestaudio/best")
+                  req.addOption("-x")
+                  req.addOption("--audio-format", "mp3")
+                  req.addOption("--audio-quality", "0")
+                  req.addOption("-o", dir.absolutePath + "/%(id)s.%(ext)s")
+
+                  var lastPush = -10
+                  YoutubeDL.getInstance().execute(req, PROCESS_ID) { p, _, line ->
+                      if (line.contains("[ExtractAudio]")) {
+                          if (item.state != SongItem.CONVERTING) {
+                              item.state = SongItem.CONVERTING
+                              push()
+                          }
+                      } else if (item.state == SongItem.DOWNLOADING) {
+                          val pct = p.toInt().coerceIn(0, 100)
+                          if (pct != item.percent) {
+                              item.percent = pct
+                              if (pct - lastPush >= 2 || pct >= 100) {
+                                  lastPush = pct
+                                  push()
+                              }
+                          }
+                      }
+                  }
+
+                  val mp3 = dir.listFiles()?.firstOrNull { it.extension == "mp3" }
+                      ?: throw Exception("Nu s-a generat MP3")
+                  saveToMusic(mp3, item.title)
+              }
+
+              private fun saveToMusic(file: File, title: String) {
+                  val clean = title.replace(Regex("""[\\/:*?"<>|]"""), "_").trim().take(120)
+                      .ifEmpty { "melodie" } + ".mp3"
+                  val values = ContentValues().apply {
+                      put(MediaStore.Audio.Media.DISPLAY_NAME, clean)
+                      put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
+                      put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/YT2MP3")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
+                      ?: throw Exception("Nu pot crea fișierul în Music")
+                  contentResolver.openOutputStream(uri)!!.use { out ->
+                      file.inputStream().use { it.copyTo(out) }
+                  }
+              }
+          }
+          EOF_6
+          mkdir -p "$(dirname "app/src/main/java/com/example/ytmp3/JobState.kt")"
+          cat > "app/src/main/java/com/example/ytmp3/JobState.kt" <<'EOF_7'
+          package com.example.ytmp3
+
+          import android.os.Handler
+          import android.os.Looper
+
+          class SongItem(val id: String, val title: String) {
+              @Volatile var state: Int = WAITING
+              @Volatile var percent: Int = 0
+
+              companion object {
+                  const val WAITING = 0
+                  const val DOWNLOADING = 1
+                  const val CONVERTING = 2
+                  const val DONE = 3
+                  const val ERROR = 4
+              }
+          }
+
+          object JobState {
+              @Volatile var items: List<SongItem> = emptyList()
+              @Volatile var running: Boolean = false
+              @Volatile var current: Int = -1
+              @Volatile var message: String = ""
+              @Volatile var listener: (() -> Unit)? = null
+              private val handler = Handler(Looper.getMainLooper())
+
+              fun changed() {
+                  handler.post { listener?.invoke() }
+              }
+
+              fun overallPercent(): Int {
+                  val list = items
+                  if (list.isEmpty()) return 0
+                  var sum = 0.0
+                  for (s in list) {
+                      sum += when (s.state) {
+                          SongItem.DOWNLOADING -> s.percent * 0.9
+                          SongItem.CONVERTING -> 95.0
+                          SongItem.DONE, SongItem.ERROR -> 100.0
+                          else -> 0.0
+                      }
+                  }
+                  return (sum / list.size).toInt().coerceIn(0, 100)
+              }
+          }
+          EOF_7
+          mkdir -p "$(dirname "app/src/main/java/com/example/ytmp3/MainActivity.kt")"
+          cat > "app/src/main/java/com/example/ytmp3/MainActivity.kt" <<'EOF_8'
+          package com.example.ytmp3
+
+          import android.Manifest
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.os.Build
+          import android.os.Bundle
+          import android.util.LruCache
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.appcompat.widget.SwitchCompat
+          import androidx.core.content.ContextCompat
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
           import java.net.URL
+          import java.util.concurrent.Executors
 
           class MainActivity : AppCompatActivity() {
 
               private lateinit var input: EditText
               private lateinit var convertBtn: Button
               private lateinit var progress: ProgressBar
+              private lateinit var overallText: TextView
               private lateinit var status: TextView
               private lateinit var playlistCheck: SwitchCompat
               private lateinit var resultCard: View
+              private lateinit var listCard: View
+              private lateinit var songList: LinearLayout
               private lateinit var thumb: ImageView
               private lateinit var songTitle: TextView
               private lateinit var songCounter: TextView
               @Volatile private var ready = false
+
+              private class Row(val bar: ProgressBar, val state: TextView)
+
+              private val rows = ArrayList<Row>()
+              private var renderedFor: List<SongItem>? = null
+              private var bigShownId = ""
+              private val cache = LruCache<String, Bitmap>(80)
+              private val executor = Executors.newFixedThreadPool(2)
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -166,12 +508,21 @@ jobs:
                   input = findViewById(R.id.linkInput)
                   convertBtn = findViewById(R.id.convertBtn)
                   progress = findViewById(R.id.progress)
+                  overallText = findViewById(R.id.overallPercent)
                   status = findViewById(R.id.status)
                   playlistCheck = findViewById(R.id.playlistCheck)
                   resultCard = findViewById(R.id.resultCard)
+                  listCard = findViewById(R.id.listCard)
+                  songList = findViewById(R.id.songList)
                   thumb = findViewById(R.id.thumb)
                   songTitle = findViewById(R.id.songTitle)
                   songCounter = findViewById(R.id.songCounter)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
 
                   Thread {
                       try {
@@ -180,7 +531,7 @@ jobs:
                           setStatus("Se actualizează yt-dlp...")
                           updateYtDlp()
                           ready = true
-                          setStatus("Gata. Lipește un link.")
+                          if (!JobState.running) setStatus("Gata. Lipește un link.")
                       } catch (e: Exception) {
                           setStatus("Eroare inițializare: ${e.message}")
                       }
@@ -192,11 +543,21 @@ jobs:
                       if (!text.isNullOrBlank()) input.setText(text.trim())
                   }
 
-                  convertBtn.setOnClickListener { convert() }
+                  convertBtn.setOnClickListener { onConvertClick() }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  JobState.listener = { render() }
+                  render()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  JobState.listener = null
               }
 
               // Actualizează yt-dlp la ultima versiune stabilă (YouTube se schimbă des).
-              // Folosește reflexie ca să meargă indiferent cum se numește constanta STABLE în bibliotecă.
               private fun updateYtDlp() {
                   try {
                       val yd = YoutubeDL.getInstance()
@@ -216,112 +577,343 @@ jobs:
 
               private fun setStatus(msg: String) = runOnUiThread { status.text = msg }
 
-              private fun showSong(title: String, id: String) {
-                  runOnUiThread { songTitle.text = title }
-                  Thread {
+              private fun onConvertClick() {
+                  if (JobState.running) {
+                      startService(Intent(this, ConvertService::class.java).setAction(ConvertService.ACTION_STOP))
+                      return
+                  }
+                  val url = input.text.toString().trim()
+                  if (url.isEmpty()) { setStatus("Introdu un link."); return }
+                  if (!ready) { setStatus("Încă se inițializează, mai așteaptă puțin."); return }
+
+                  JobState.items = emptyList()
+                  JobState.current = -1
+                  JobState.message = "Se citește lista..."
+                  JobState.running = true
+
+                  val i = Intent(this, ConvertService::class.java)
+                      .putExtra(ConvertService.EXTRA_URL, url)
+                      .putExtra(ConvertService.EXTRA_PLAYLIST, playlistCheck.isChecked)
+                  ContextCompat.startForegroundService(this, i)
+                  render()
+              }
+
+              private fun loadThumb(url: String, view: ImageView) {
+                  view.tag = url
+                  val cached = cache.get(url)
+                  if (cached != null) {
+                      view.scaleType = ImageView.ScaleType.CENTER_CROP
+                      view.setImageBitmap(cached)
+                      return
+                  }
+                  view.scaleType = ImageView.ScaleType.CENTER
+                  view.setImageResource(R.drawable.ic_play)
+                  executor.execute {
                       try {
-                          val conn = URL("https://i.ytimg.com/vi/$id/mqdefault.jpg").openConnection()
+                          val conn = URL(url).openConnection()
                           conn.connectTimeout = 8000
                           conn.readTimeout = 8000
                           val bmp = conn.getInputStream().use { BitmapFactory.decodeStream(it) }
                           if (bmp != null) {
+                              cache.put(url, bmp)
                               runOnUiThread {
-                                  thumb.scaleType = ImageView.ScaleType.CENTER_CROP
-                                  thumb.setImageBitmap(bmp)
+                                  if (view.tag == url) {
+                                      view.scaleType = ImageView.ScaleType.CENTER_CROP
+                                      view.setImageBitmap(bmp)
+                                  }
                               }
                           }
                       } catch (e: Exception) {
                           // fără miniatură, nu e grav
                       }
-                  }.start()
+                  }
               }
 
-              private fun convert() {
-                  val url = input.text.toString().trim()
-                  if (url.isEmpty()) { setStatus("Introdu un link."); return }
-                  if (!ready) { setStatus("Încă se inițializează, mai așteaptă puțin."); return }
+              private fun render() {
+                  val items = JobState.items
+                  val running = JobState.running
+                  convertBtn.text = if (running) "STOP" else "CONVERT"
+                  if (JobState.message.isNotEmpty()) status.text = JobState.message
 
-                  val playlist = playlistCheck.isChecked
-                  convertBtn.isEnabled = false
-                  progress.progress = 0
+                  if (!running && items.isEmpty()) {
+                      resultCard.visibility = View.GONE
+                      listCard.visibility = View.GONE
+                      return
+                  }
                   resultCard.visibility = View.VISIBLE
-                  thumb.scaleType = ImageView.ScaleType.CENTER
-                  thumb.setImageResource(R.drawable.ic_play)
-                  songTitle.text = "Se pregătește..."
-                  songCounter.text = ""
-                  setStatus("Se descarcă și se convertește...")
+                  listCard.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
 
-                  Thread {
-                      val dir = File(cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
-                      try {
-                          val req = YoutubeDLRequest(url)
-                          if (playlist) {
-                              req.addOption("--yes-playlist")
-                              req.addOption("-i") // sare peste videoclipurile indisponibile
-                          } else {
-                              req.addOption("--no-playlist")
-                          }
-                          req.addOption("-f", "bestaudio/best")
-                          req.addOption("-x")
-                          req.addOption("--audio-format", "mp3")
-                          req.addOption("--audio-quality", "0")
-                          req.addOption("-o", dir.absolutePath + "/%(title)s [%(id)s].%(ext)s")
-
-                          val itemRegex = Regex("""Downloading item (\d+) of (\d+)""")
-                          val destRegex = Regex("""Destination: .*/(.+) \[([A-Za-z0-9_-]{11})\]\.\w+\s*$""")
-                          var lastId = ""
-                          try {
-                              YoutubeDL.getInstance().execute(req) { p, _, line ->
-                                  itemRegex.find(line)?.let {
-                                      val txt = "MELODIA ${it.groupValues[1]} / ${it.groupValues[2]}"
-                                      runOnUiThread { songCounter.text = txt }
-                                  }
-                                  destRegex.find(line)?.let {
-                                      val id = it.groupValues[2]
-                                      if (id != lastId) {
-                                          lastId = id
-                                          showSong(it.groupValues[1], id)
-                                      }
-                                  }
-                                  runOnUiThread { progress.progress = p.toInt().coerceAtLeast(0) }
-                              }
-                          } catch (e: Exception) {
-                              // la playlist, păstrăm ce s-a convertit deja
-                              if (!playlist || dir.listFiles()?.any { it.extension == "mp3" } != true) throw e
-                          }
-
-                          val files = dir.listFiles()?.filter { it.extension == "mp3" }.orEmpty()
-                          if (files.isEmpty()) throw Exception("Nu s-a generat niciun MP3")
-                          files.forEach { saveToMusic(it) }
-                          runOnUiThread { progress.progress = 100 }
-                          setStatus("Salvate ${files.size} fișier(e) în Music/YT2MP3")
-                      } catch (e: Exception) {
-                          setStatus("Eroare: ${e.message}")
-                      } finally {
-                          dir.deleteRecursively()
-                          runOnUiThread { convertBtn.isEnabled = true }
+                  if (renderedFor !== items) {
+                      songList.removeAllViews()
+                      rows.clear()
+                      for (item in items) {
+                          val v = layoutInflater.inflate(R.layout.item_song, songList, false)
+                          v.findViewById<TextView>(R.id.rowTitle).text = item.title
+                          loadThumb("https://i.ytimg.com/vi/" + item.id + "/default.jpg", v.findViewById(R.id.rowThumb))
+                          rows.add(Row(v.findViewById(R.id.rowBar), v.findViewById(R.id.rowState)))
+                          songList.addView(v)
                       }
-                  }.start()
-              }
+                      renderedFor = items
+                      bigShownId = ""
+                  }
 
-              private fun saveToMusic(file: File) {
-                  val cleanName = file.nameWithoutExtension
-                      .replace(Regex(""" \[[A-Za-z0-9_-]{11}\]$"""), "") + ".mp3"
-                  val values = ContentValues().apply {
-                      put(MediaStore.Audio.Media.DISPLAY_NAME, cleanName)
-                      put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
-                      put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/YT2MP3")
+                  for ((i, item) in items.withIndex()) {
+                      if (i >= rows.size) break
+                      val r = rows[i]
+                      when (item.state) {
+                          SongItem.DOWNLOADING -> {
+                              r.state.text = item.percent.toString() + "%"
+                              r.state.setTextColor(getColor(R.color.cyan))
+                              r.bar.progress = item.percent
+                          }
+                          SongItem.CONVERTING -> {
+                              r.state.text = "CONVERSIE"
+                              r.state.setTextColor(getColor(R.color.violet))
+                              r.bar.progress = 100
+                          }
+                          SongItem.DONE -> {
+                              r.state.text = "GATA"
+                              r.state.setTextColor(getColor(R.color.cyan))
+                              r.bar.progress = 100
+                          }
+                          SongItem.ERROR -> {
+                              r.state.text = "EROARE"
+                              r.state.setTextColor(getColor(R.color.error))
+                              r.bar.progress = 0
+                          }
+                          else -> {
+                              r.state.text = "AȘTEAPTĂ"
+                              r.state.setTextColor(getColor(R.color.text2))
+                              r.bar.progress = 0
+                          }
+                      }
                   }
-                  val uri = contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
-                      ?: throw Exception("Nu pot crea fișierul în Music")
-                  contentResolver.openOutputStream(uri)!!.use { out ->
-                      file.inputStream().use { it.copyTo(out) }
+
+                  val cur = JobState.current
+                  if (cur in items.indices) {
+                      val s = items[cur]
+                      songTitle.text = s.title
+                      songCounter.text = "MELODIA " + (cur + 1) + " / " + items.size
+                      if (bigShownId != s.id) {
+                          bigShownId = s.id
+                          loadThumb("https://i.ytimg.com/vi/" + s.id + "/mqdefault.jpg", thumb)
+                      }
+                  } else if (running) {
+                      songTitle.text = "Se citește lista..."
+                      songCounter.text = ""
                   }
+                  val pct = JobState.overallPercent()
+                  progress.progress = pct
+                  overallText.text = pct.toString() + "%"
               }
           }
-          EOF_6
+          EOF_8
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_btn_paste.xml")"
+          cat > "app/src/main/res/drawable/bg_btn_paste.xml" <<'EOF_9'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@android:color/transparent" />
+              <corners android:radius="8dp" />
+              <stroke android:width="1dp" android:color="@color/cyan" />
+          </shape>
+          EOF_9
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_card.xml")"
+          cat > "app/src/main/res/drawable/bg_card.xml" <<'EOF_10'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/card" />
+              <corners android:radius="16dp" />
+              <stroke android:width="1dp" android:color="@color/stroke" />
+          </shape>
+          EOF_10
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_input.xml")"
+          cat > "app/src/main/res/drawable/bg_input.xml" <<'EOF_11'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/bg" />
+              <corners android:radius="12dp" />
+              <stroke android:width="1dp" android:color="@color/stroke_input" />
+          </shape>
+          EOF_11
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_thumb.xml")"
+          cat > "app/src/main/res/drawable/bg_thumb.xml" <<'EOF_12'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/stroke" />
+              <corners android:radius="10dp" />
+          </shape>
+          EOF_12
+          mkdir -p "$(dirname "app/src/main/res/drawable/btn_convert.xml")"
+          cat > "app/src/main/res/drawable/btn_convert.xml" <<'EOF_13'
+          <?xml version="1.0" encoding="utf-8"?>
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_enabled="false">
+                  <shape android:shape="rectangle">
+                      <solid android:color="#164E57" />
+                      <corners android:radius="14dp" />
+                  </shape>
+              </item>
+              <item>
+                  <shape android:shape="rectangle">
+                      <solid android:color="@color/cyan" />
+                      <corners android:radius="14dp" />
+                  </shape>
+              </item>
+          </selector>
+          EOF_13
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_launcher_foreground.xml")"
+          cat > "app/src/main/res/drawable/ic_launcher_foreground.xml" <<'EOF_14'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M54,30 L74.8,42 L74.8,66 L54,78 L33.2,66 L33.2,42 Z"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="3" />
+              <path
+                  android:pathData="M43,52 L43,56"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="4" />
+              <path
+                  android:pathData="M48.5,46.5 L48.5,61.5"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="4" />
+              <path
+                  android:pathData="M54,41 L54,67"
+                  android:strokeColor="#A78BFA"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="4" />
+              <path
+                  android:pathData="M59.5,46.5 L59.5,61.5"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="4" />
+              <path
+                  android:pathData="M65,52 L65,56"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="4" />
+          </vector>
+          EOF_14
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_logo_mark.xml")"
+          cat > "app/src/main/res/drawable/ic_logo_mark.xml" <<'EOF_15'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="40dp"
+              android:height="40dp"
+              android:viewportWidth="96"
+              android:viewportHeight="96">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M48,10 L82,29 L82,67 L48,86 L14,67 L14,29 Z"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="5" />
+              <path
+                  android:pathData="M32.5,45 L32.5,51"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="7" />
+              <path
+                  android:pathData="M42.5,38 L42.5,58"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="7" />
+              <path
+                  android:pathData="M52.5,30 L52.5,66"
+                  android:strokeColor="#A78BFA"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="7" />
+              <path
+                  android:pathData="M62.5,38 L62.5,58"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="7" />
+          </vector>
+          EOF_15
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_notif.xml")"
+          cat > "app/src/main/res/drawable/ic_notif.xml" <<'EOF_16'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M12,3 L19.8,7.5 L19.8,16.5 L12,21 L4.2,16.5 L4.2,7.5 Z"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="1.6" />
+              <path
+                  android:pathData="M8.6,11.2 L8.6,12.8"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="1.2" />
+              <path
+                  android:pathData="M10.3,9.6 L10.3,14.4"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="1.2" />
+              <path
+                  android:pathData="M12,8 L12,16"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="1.2" />
+              <path
+                  android:pathData="M13.7,9.6 L13.7,14.4"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="1.2" />
+              <path
+                  android:pathData="M15.4,11.2 L15.4,12.8"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="1.2" />
+          </vector>
+          EOF_16
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_play.xml")"
+          cat > "app/src/main/res/drawable/ic_play.xml" <<'EOF_17'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#A78BFA"
+                  android:pathData="M8,5 L8,19 L19,12 Z" />
+          </vector>
+          EOF_17
+          mkdir -p "$(dirname "app/src/main/res/drawable/progress_bar.xml")"
+          cat > "app/src/main/res/drawable/progress_bar.xml" <<'EOF_18'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:id="@android:id/background">
+                  <shape android:shape="rectangle">
+                      <corners android:radius="3dp" />
+                      <solid android:color="@color/stroke" />
+                  </shape>
+              </item>
+              <item android:id="@android:id/progress">
+                  <clip>
+                      <shape android:shape="rectangle">
+                          <corners android:radius="3dp" />
+                          <solid android:color="@color/cyan" />
+                      </shape>
+                  </clip>
+              </item>
+          </layer-list>
+          EOF_18
           mkdir -p "$(dirname "app/src/main/res/layout/activity_main.xml")"
-          cat > "app/src/main/res/layout/activity_main.xml" <<'EOF_7'
+          cat > "app/src/main/res/layout/activity_main.xml" <<'EOF_19'
           <?xml version="1.0" encoding="utf-8"?>
           <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="match_parent"
@@ -525,14 +1117,60 @@ jobs:
                           </LinearLayout>
                       </LinearLayout>
 
-                      <ProgressBar
-                          android:id="@+id/progress"
-                          style="?android:attr/progressBarStyleHorizontal"
+                      <LinearLayout
                           android:layout_width="match_parent"
-                          android:layout_height="6dp"
+                          android:layout_height="wrap_content"
                           android:layout_marginTop="14dp"
-                          android:max="100"
-                          android:progressDrawable="@drawable/progress_bar" />
+                          android:gravity="center_vertical"
+                          android:orientation="horizontal">
+
+                          <ProgressBar
+                              android:id="@+id/progress"
+                              style="?android:attr/progressBarStyleHorizontal"
+                              android:layout_width="0dp"
+                              android:layout_height="6dp"
+                              android:layout_weight="1"
+                              android:max="100"
+                              android:progressDrawable="@drawable/progress_bar" />
+
+                          <TextView
+                              android:id="@+id/overallPercent"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:layout_marginStart="10dp"
+                              android:fontFamily="monospace"
+                              android:text="0%"
+                              android:textColor="@color/cyan"
+                              android:textSize="13sp"
+                              android:textStyle="bold" />
+                      </LinearLayout>
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:id="@+id/listCard"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:background="@drawable/bg_card"
+                      android:orientation="vertical"
+                      android:padding="14dp"
+                      android:visibility="gone">
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:fontFamily="monospace"
+                          android:letterSpacing="0.15"
+                          android:text="LISTA MELODII"
+                          android:textColor="@color/text2"
+                          android:textSize="11sp" />
+
+                      <LinearLayout
+                          android:id="@+id/songList"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:orientation="vertical" />
                   </LinearLayout>
 
                   <TextView
@@ -546,15 +1184,106 @@ jobs:
                       android:textSize="12sp" />
               </LinearLayout>
           </ScrollView>
-          EOF_7
+          EOF_19
+          mkdir -p "$(dirname "app/src/main/res/layout/item_song.xml")"
+          cat > "app/src/main/res/layout/item_song.xml" <<'EOF_20'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:gravity="center_vertical"
+              android:orientation="horizontal"
+              android:paddingTop="6dp"
+              android:paddingBottom="6dp">
+
+              <ImageView
+                  android:id="@+id/rowThumb"
+                  android:layout_width="56dp"
+                  android:layout_height="42dp"
+                  android:background="@drawable/bg_thumb"
+                  android:clipToOutline="true"
+                  android:contentDescription="Miniatură"
+                  android:scaleType="center"
+                  android:src="@drawable/ic_play" />
+
+              <LinearLayout
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="10dp"
+                  android:layout_marginEnd="8dp"
+                  android:layout_weight="1"
+                  android:orientation="vertical">
+
+                  <TextView
+                      android:id="@+id/rowTitle"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:ellipsize="end"
+                      android:maxLines="2"
+                      android:textColor="@color/text"
+                      android:textSize="13sp" />
+
+                  <ProgressBar
+                      android:id="@+id/rowBar"
+                      style="?android:attr/progressBarStyleHorizontal"
+                      android:layout_width="match_parent"
+                      android:layout_height="4dp"
+                      android:layout_marginTop="6dp"
+                      android:max="100"
+                      android:progressDrawable="@drawable/progress_bar" />
+              </LinearLayout>
+
+              <TextView
+                  android:id="@+id/rowState"
+                  android:layout_width="84dp"
+                  android:layout_height="wrap_content"
+                  android:fontFamily="monospace"
+                  android:gravity="end"
+                  android:textColor="@color/text2"
+                  android:textSize="11sp" />
+          </LinearLayout>
+          EOF_20
+          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml")"
+          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'EOF_21'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF_21
+          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml")"
+          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" <<'EOF_22'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF_22
+          mkdir -p "$(dirname "app/src/main/res/values/colors.xml")"
+          cat > "app/src/main/res/values/colors.xml" <<'EOF_23'
+          <resources>
+              <color name="bg">#0A0C10</color>
+              <color name="card">#12151B</color>
+              <color name="stroke">#232834</color>
+              <color name="stroke_input">#2B3240</color>
+              <color name="cyan">#22D3EE</color>
+              <color name="violet">#A78BFA</color>
+              <color name="text">#F2F3F5</color>
+              <color name="text2">#8A8F9A</color>
+              <color name="hint">#6B7280</color>
+              <color name="error">#F87171</color>
+              <color name="on_cyan">#04262B</color>
+              <color name="icon_bg">#0A0C10</color>
+          </resources>
+          EOF_23
           mkdir -p "$(dirname "app/src/main/res/values/strings.xml")"
-          cat > "app/src/main/res/values/strings.xml" <<'EOF_8'
+          cat > "app/src/main/res/values/strings.xml" <<'EOF_24'
           <resources>
               <string name="app_name">TDG YT2MP3 CONVERT</string>
           </resources>
-          EOF_8
+          EOF_24
           mkdir -p "$(dirname "app/src/main/res/values/themes.xml")"
-          cat > "app/src/main/res/values/themes.xml" <<'EOF_9'
+          cat > "app/src/main/res/values/themes.xml" <<'EOF_25'
           <resources>
               <style name="Theme.App" parent="Theme.AppCompat.NoActionBar">
                   <item name="colorPrimary">@color/cyan</item>
@@ -569,202 +1298,7 @@ jobs:
                   <item name="android:textColorHint">@color/hint</item>
               </style>
           </resources>
-          EOF_9
-          mkdir -p "$(dirname "app/src/main/res/values/colors.xml")"
-          cat > "app/src/main/res/values/colors.xml" <<'EOF_10'
-          <resources>
-              <color name="bg">#0A0C10</color>
-              <color name="card">#12151B</color>
-              <color name="stroke">#232834</color>
-              <color name="stroke_input">#2B3240</color>
-              <color name="cyan">#22D3EE</color>
-              <color name="violet">#A78BFA</color>
-              <color name="text">#F2F3F5</color>
-              <color name="text2">#8A8F9A</color>
-              <color name="hint">#6B7280</color>
-              <color name="on_cyan">#04262B</color>
-              <color name="icon_bg">#0A0C10</color>
-          </resources>
-          EOF_10
-          mkdir -p "$(dirname "app/src/main/res/drawable/bg_btn_paste.xml")"
-          cat > "app/src/main/res/drawable/bg_btn_paste.xml" <<'EOF_11'
-          <?xml version="1.0" encoding="utf-8"?>
-          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-              <solid android:color="@android:color/transparent" />
-              <corners android:radius="8dp" />
-              <stroke android:width="1dp" android:color="@color/cyan" />
-          </shape>
-          EOF_11
-          mkdir -p "$(dirname "app/src/main/res/drawable/bg_card.xml")"
-          cat > "app/src/main/res/drawable/bg_card.xml" <<'EOF_12'
-          <?xml version="1.0" encoding="utf-8"?>
-          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-              <solid android:color="@color/card" />
-              <corners android:radius="16dp" />
-              <stroke android:width="1dp" android:color="@color/stroke" />
-          </shape>
-          EOF_12
-          mkdir -p "$(dirname "app/src/main/res/drawable/bg_input.xml")"
-          cat > "app/src/main/res/drawable/bg_input.xml" <<'EOF_13'
-          <?xml version="1.0" encoding="utf-8"?>
-          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-              <solid android:color="@color/bg" />
-              <corners android:radius="12dp" />
-              <stroke android:width="1dp" android:color="@color/stroke_input" />
-          </shape>
-          EOF_13
-          mkdir -p "$(dirname "app/src/main/res/drawable/bg_thumb.xml")"
-          cat > "app/src/main/res/drawable/bg_thumb.xml" <<'EOF_14'
-          <?xml version="1.0" encoding="utf-8"?>
-          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-              <solid android:color="@color/stroke" />
-              <corners android:radius="10dp" />
-          </shape>
-          EOF_14
-          mkdir -p "$(dirname "app/src/main/res/drawable/btn_convert.xml")"
-          cat > "app/src/main/res/drawable/btn_convert.xml" <<'EOF_15'
-          <?xml version="1.0" encoding="utf-8"?>
-          <selector xmlns:android="http://schemas.android.com/apk/res/android">
-              <item android:state_enabled="false">
-                  <shape android:shape="rectangle">
-                      <solid android:color="#164E57" />
-                      <corners android:radius="14dp" />
-                  </shape>
-              </item>
-              <item>
-                  <shape android:shape="rectangle">
-                      <solid android:color="@color/cyan" />
-                      <corners android:radius="14dp" />
-                  </shape>
-              </item>
-          </selector>
-          EOF_15
-          mkdir -p "$(dirname "app/src/main/res/drawable/ic_launcher_foreground.xml")"
-          cat > "app/src/main/res/drawable/ic_launcher_foreground.xml" <<'EOF_16'
-          <?xml version="1.0" encoding="utf-8"?>
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="108dp"
-              android:height="108dp"
-              android:viewportWidth="108"
-              android:viewportHeight="108">
-              <path
-                  android:fillColor="#00000000"
-                  android:pathData="M54,30 L74.8,42 L74.8,66 L54,78 L33.2,66 L33.2,42 Z"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineJoin="round"
-                  android:strokeWidth="3" />
-              <path
-                  android:pathData="M43,52 L43,56"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M48.5,46.5 L48.5,61.5"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M54,41 L54,67"
-                  android:strokeColor="#A78BFA"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M59.5,46.5 L59.5,61.5"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M65,52 L65,56"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-          </vector>
-          EOF_16
-          mkdir -p "$(dirname "app/src/main/res/drawable/ic_logo_mark.xml")"
-          cat > "app/src/main/res/drawable/ic_logo_mark.xml" <<'EOF_17'
-          <?xml version="1.0" encoding="utf-8"?>
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="40dp"
-              android:height="40dp"
-              android:viewportWidth="96"
-              android:viewportHeight="96">
-              <path
-                  android:fillColor="#00000000"
-                  android:pathData="M48,10 L82,29 L82,67 L48,86 L14,67 L14,29 Z"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineJoin="round"
-                  android:strokeWidth="5" />
-              <path
-                  android:pathData="M32.5,45 L32.5,51"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-              <path
-                  android:pathData="M42.5,38 L42.5,58"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-              <path
-                  android:pathData="M52.5,30 L52.5,66"
-                  android:strokeColor="#A78BFA"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-              <path
-                  android:pathData="M62.5,38 L62.5,58"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-          </vector>
-          EOF_17
-          mkdir -p "$(dirname "app/src/main/res/drawable/ic_play.xml")"
-          cat > "app/src/main/res/drawable/ic_play.xml" <<'EOF_18'
-          <?xml version="1.0" encoding="utf-8"?>
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="24dp"
-              android:height="24dp"
-              android:viewportWidth="24"
-              android:viewportHeight="24">
-              <path
-                  android:fillColor="#A78BFA"
-                  android:pathData="M8,5 L8,19 L19,12 Z" />
-          </vector>
-          EOF_18
-          mkdir -p "$(dirname "app/src/main/res/drawable/progress_bar.xml")"
-          cat > "app/src/main/res/drawable/progress_bar.xml" <<'EOF_19'
-          <?xml version="1.0" encoding="utf-8"?>
-          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-              <item android:id="@android:id/background">
-                  <shape android:shape="rectangle">
-                      <corners android:radius="3dp" />
-                      <solid android:color="@color/stroke" />
-                  </shape>
-              </item>
-              <item android:id="@android:id/progress">
-                  <clip>
-                      <shape android:shape="rectangle">
-                          <corners android:radius="3dp" />
-                          <solid android:color="@color/cyan" />
-                      </shape>
-                  </clip>
-              </item>
-          </layer-list>
-          EOF_19
-          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml")"
-          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'EOF_20'
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/icon_bg" />
-              <foreground android:drawable="@drawable/ic_launcher_foreground" />
-          </adaptive-icon>
-          EOF_20
-          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml")"
-          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" <<'EOF_21'
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/icon_bg" />
-              <foreground android:drawable="@drawable/ic_launcher_foreground" />
-          </adaptive-icon>
-          EOF_21
+          EOF_25
 
       - uses: actions/setup-java@v4
         with:
