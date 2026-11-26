@@ -154,21 +154,30 @@ jobs:
           import com.yausername.youtubedl_android.YoutubeDL
           import com.yausername.youtubedl_android.YoutubeDLRequest
           import java.io.File
+          import java.util.concurrent.CopyOnWriteArrayList
+          import java.util.concurrent.atomic.AtomicInteger
 
           class ConvertService : Service() {
 
               companion object {
-                  const val EXTRA_URL = "url"
+                  const val EXTRA_URLS = "urls"
                   const val EXTRA_PLAYLIST = "playlist"
+                  const val EXTRA_SKIP = "skip"
                   const val ACTION_STOP = "com.example.ytmp3.STOP"
                   const val CHANNEL = "convert"
                   const val NOTIF_ID = 1
                   const val DONE_NOTIF_ID = 2
                   const val PROCESS_ID = "tdg_convert"
+                  const val LIST_PROCESS_ID = "tdg_list"
                   @Volatile var working = false
               }
 
               @Volatile private var cancelled = false
+              @Volatile private var skipDup = true
+              private val seen = java.util.Collections.synchronizedSet(HashSet<String>())
+              private val badLinks = AtomicInteger(0)
+              private val pendingListings = AtomicInteger(0)
+              private val listLock = Any()
 
               override fun onBind(intent: Intent?): IBinder? = null
 
@@ -177,6 +186,11 @@ jobs:
                       cancelled = true
                       try {
                           YoutubeDL.getInstance().destroyProcessById(PROCESS_ID)
+                      } catch (e: Throwable) {
+                          // nu e nimic de oprit
+                      }
+                      try {
+                          YoutubeDL.getInstance().destroyProcessById(LIST_PROCESS_ID)
                       } catch (e: Throwable) {
                           // nu e nimic de oprit
                       }
@@ -195,15 +209,26 @@ jobs:
                       ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                   )
 
-                  val url = intent?.getStringExtra(EXTRA_URL)
-                  if (url == null || working) {
+                  val urls = intent?.getStringArrayListExtra(EXTRA_URLS)
+                  val playlist = intent?.getBooleanExtra(EXTRA_PLAYLIST, false) ?: false
+                  val skip = intent?.getBooleanExtra(EXTRA_SKIP, true) ?: true
+                  if (urls == null || urls.isEmpty()) {
                       if (!working) stopSelf()
                       return START_NOT_STICKY
                   }
-                  val playlist = intent.getBooleanExtra(EXTRA_PLAYLIST, false)
+
+                  if (working) {
+                      // O conversie rulează deja: adăugăm linkurile noi la finalul listei.
+                      skipDup = skip
+                      pendingListings.incrementAndGet()
+                      Thread { addUrls(urls, playlist) }.start()
+                      return START_NOT_STICKY
+                  }
+
                   cancelled = false
+                  skipDup = skip
                   working = true
-                  Thread { runJob(url, playlist) }.start()
+                  Thread { runJob(urls, playlist) }.start()
                   return START_NOT_STICKY
               }
 
@@ -261,63 +286,133 @@ jobs:
                       .notify(NOTIF_ID, buildNotif(text, pct, list.isEmpty()))
               }
 
-              private fun runJob(url: String, playlist: Boolean) {
+              // Adaugă linkuri noi în timp ce conversia curentă continuă.
+              private fun addUrls(urls: List<String>, playlist: Boolean) {
+                  var added = 0
+                  try {
+                      synchronized(listLock) {
+                          for (u in urls) {
+                              if (cancelled) break
+                              try {
+                                  for (s in fetchList(u, playlist, LIST_PROCESS_ID)) {
+                                      if (seen.add(s.id)) {
+                                          if (skipDup && alreadyDownloaded(s.id)) s.state = SongItem.SKIPPED
+                                          JobState.items.add(s)
+                                          added++
+                                      }
+                                  }
+                              } catch (e: Exception) {
+                                  if (cancelled) break
+                                  badLinks.incrementAndGet()
+                              }
+                          }
+                      }
+                      JobState.message = if (added > 0) {
+                          "Adăugate " + added + " melodii în coadă"
+                      } else {
+                          "Nimic nou de adăugat (linkuri invalide sau deja în listă)"
+                      }
+                      push()
+                  } finally {
+                      pendingListings.decrementAndGet()
+                  }
+              }
+
+              private fun runJob(urls: List<String>, playlist: Boolean) {
                   val pm = getSystemService(POWER_SERVICE) as PowerManager
                   val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ytmp3:job")
                   wl.acquire(6 * 60 * 60 * 1000L)
                   val dir = File(cacheDir, "dl")
                   var saved = 0
                   var failed = 0
+                  var skipped = 0
                   var finalMsg = ""
                   try {
                       YoutubeDL.getInstance().init(application)
                       FFmpeg.getInstance().init(application)
 
-                      JobState.items = emptyList()
+                      val list = CopyOnWriteArrayList<SongItem>()
+                      seen.clear()
+                      badLinks.set(0)
+                      JobState.items = list
                       JobState.current = -1
                       JobState.message = "Se citește lista..."
                       push()
 
-                      val list = fetchList(url, playlist)
+                      // Citește toate linkurile și combină melodiile într-o singură listă.
+                      for ((n, u) in urls.withIndex()) {
+                          if (cancelled) break
+                          JobState.message = "Se citesc linkurile " + (n + 1) + "/" + urls.size + "..."
+                          push()
+                          try {
+                              for (s in fetchList(u, playlist, PROCESS_ID)) {
+                                  if (seen.add(s.id)) {
+                                      if (skipDup && alreadyDownloaded(s.id)) s.state = SongItem.SKIPPED
+                                      list.add(s)
+                                  }
+                              }
+                          } catch (e: Exception) {
+                              if (cancelled) break
+                              badLinks.incrementAndGet()
+                          }
+                      }
                       if (cancelled) throw Exception("Oprit")
-                      if (list.isEmpty()) throw Exception("Nu am găsit nicio melodie la acest link")
+                      if (list.isEmpty() && pendingListings.get() == 0) {
+                          throw Exception("Nu am găsit nicio melodie la linkurile date")
+                      }
 
-                      JobState.items = list
                       JobState.message = "Se descarcă " + list.size + " melodie(i)..."
                       push()
 
-                      for ((index, item) in list.withIndex()) {
-                          if (cancelled) break
-                          JobState.current = index
-                          item.state = SongItem.DOWNLOADING
-                          item.percent = 0
-                          push()
-                          try {
-                              dir.deleteRecursively()
-                              dir.mkdirs()
-                              downloadOne(item, dir)
-                              item.state = SongItem.DONE
-                              item.percent = 100
-                              saved++
-                          } catch (e: Exception) {
-                              if (cancelled) {
-                                  item.state = SongItem.WAITING
-                                  item.percent = 0
-                                  break
+                      // Procesează lista pe rând. Linkurile adăugate între timp apar la final.
+                      var index = 0
+                      while (!cancelled) {
+                          if (index < list.size) {
+                              val item = list[index]
+                              if (item.state == SongItem.SKIPPED) {
+                                  skipped++
+                                  index++
+                                  JobState.changed()
+                                  continue
                               }
-                              item.state = SongItem.ERROR
-                              failed++
+                              JobState.current = index
+                              item.state = SongItem.DOWNLOADING
+                              item.percent = 0
+                              push()
+                              try {
+                                  dir.deleteRecursively()
+                                  dir.mkdirs()
+                                  downloadOne(item, dir)
+                                  item.state = SongItem.DONE
+                                  item.percent = 100
+                                  saved++
+                              } catch (e: Exception) {
+                                  if (cancelled) {
+                                      item.state = SongItem.WAITING
+                                      item.percent = 0
+                                      break
+                                  }
+                                  item.state = SongItem.ERROR
+                                  failed++
+                              }
+                              push()
+                              index++
+                          } else if (pendingListings.get() > 0) {
+                              Thread.sleep(300)
+                          } else {
+                              break
                           }
-                          push()
                       }
 
+                      val bad = if (badLinks.get() > 0) " · " + badLinks.get() + " link(uri) nevalide" else ""
+                      val sk = if (skipped > 0) ", " + skipped + " sărite (existau deja)" else ""
                       finalMsg = when {
                           cancelled -> "Oprit. Salvate: $saved"
-                          failed > 0 -> "Gata: $saved salvate, $failed eșuate"
-                          else -> "Gata: $saved salvate în Music/YT2MP3"
+                          failed > 0 -> "Gata: $saved salvate" + sk + ", $failed eșuate" + bad
+                          else -> "Gata: $saved salvate în Music/YT2MP3" + sk + bad
                       }
                   } catch (e: Exception) {
-                      finalMsg = "Eroare: " + e.message
+                      finalMsg = if (cancelled) "Oprit" else "Eroare: " + e.message
                   } finally {
                       JobState.message = finalMsg
                       JobState.running = false
@@ -332,13 +427,13 @@ jobs:
               }
 
               // Citește lista completă (id + titlu) fără să descarce nimic.
-              private fun fetchList(url: String, playlist: Boolean): List<SongItem> {
+              private fun fetchList(url: String, playlist: Boolean, processId: String): List<SongItem> {
                   val req = YoutubeDLRequest(url)
                   req.addOption(if (playlist) "--yes-playlist" else "--no-playlist")
                   req.addOption("--flat-playlist")
                   req.addOption("-i")
                   req.addOption("--print", "%(id)s|%(title)s")
-                  val out = YoutubeDL.getInstance().execute(req, PROCESS_ID) { _, _, _ -> }.out
+                  val out = YoutubeDL.getInstance().execute(req, processId) { _, _, _ -> }.out
                   val idRegex = Regex("^[A-Za-z0-9_-]{11}$")
                   val result = ArrayList<SongItem>()
                   for (raw in out.split("\n")) {
@@ -382,10 +477,30 @@ jobs:
 
                   val mp3 = dir.listFiles()?.firstOrNull { it.extension == "mp3" }
                       ?: throw Exception("Nu s-a generat MP3")
-                  saveToMusic(mp3, item.title)
+                  val savedName = saveToMusic(mp3, item.title)
+                  getSharedPreferences("history", MODE_PRIVATE).edit()
+                      .putString("dl_" + item.id, savedName).apply()
               }
 
-              private fun saveToMusic(file: File, title: String) {
+              // True dacă melodia a mai fost descărcată și fișierul încă există în Music/YT2MP3.
+              private fun alreadyDownloaded(id: String): Boolean {
+                  val name = getSharedPreferences("history", MODE_PRIVATE).getString("dl_" + id, null)
+                      ?: return false
+                  return try {
+                      contentResolver.query(
+                          MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                          arrayOf(MediaStore.Audio.Media._ID),
+                          MediaStore.Audio.Media.DISPLAY_NAME + "=? AND " +
+                              MediaStore.Audio.Media.RELATIVE_PATH + " LIKE ?",
+                          arrayOf(name, Environment.DIRECTORY_MUSIC + "/YT2MP3%"),
+                          null
+                      )?.use { it.count > 0 } ?: true
+                  } catch (e: Exception) {
+                      true
+                  }
+              }
+
+              private fun saveToMusic(file: File, title: String): String {
                   val clean = title.replace(Regex("""[\\/:*?"<>|]"""), "_").trim().take(120)
                       .ifEmpty { "melodie" } + ".mp3"
                   val values = ContentValues().apply {
@@ -398,6 +513,7 @@ jobs:
                   contentResolver.openOutputStream(uri)!!.use { out ->
                       file.inputStream().use { it.copyTo(out) }
                   }
+                  return clean
               }
           }
           EOF_6
@@ -407,6 +523,7 @@ jobs:
 
           import android.os.Handler
           import android.os.Looper
+          import java.util.concurrent.CopyOnWriteArrayList
 
           class SongItem(val id: String, val title: String) {
               @Volatile var state: Int = WAITING
@@ -418,11 +535,12 @@ jobs:
                   const val CONVERTING = 2
                   const val DONE = 3
                   const val ERROR = 4
+                  const val SKIPPED = 5
               }
           }
 
           object JobState {
-              @Volatile var items: List<SongItem> = emptyList()
+              @Volatile var items: CopyOnWriteArrayList<SongItem> = CopyOnWriteArrayList()
               @Volatile var running: Boolean = false
               @Volatile var current: Int = -1
               @Volatile var message: String = ""
@@ -441,7 +559,7 @@ jobs:
                       sum += when (s.state) {
                           SongItem.DOWNLOADING -> s.percent * 0.9
                           SongItem.CONVERTING -> 95.0
-                          SongItem.DONE, SongItem.ERROR -> 100.0
+                          SongItem.DONE, SongItem.ERROR, SongItem.SKIPPED -> 100.0
                           else -> 0.0
                       }
                   }
@@ -475,16 +593,19 @@ jobs:
           import com.yausername.ffmpeg.FFmpeg
           import com.yausername.youtubedl_android.YoutubeDL
           import java.net.URL
+          import java.util.concurrent.CopyOnWriteArrayList
           import java.util.concurrent.Executors
 
           class MainActivity : AppCompatActivity() {
 
               private lateinit var input: EditText
               private lateinit var convertBtn: Button
+              private lateinit var addBtn: Button
               private lateinit var progress: ProgressBar
               private lateinit var overallText: TextView
               private lateinit var status: TextView
               private lateinit var playlistCheck: SwitchCompat
+              private lateinit var skipCheck: SwitchCompat
               private lateinit var resultCard: View
               private lateinit var listCard: View
               private lateinit var songList: LinearLayout
@@ -507,10 +628,17 @@ jobs:
 
                   input = findViewById(R.id.linkInput)
                   convertBtn = findViewById(R.id.convertBtn)
+                  addBtn = findViewById(R.id.addBtn)
                   progress = findViewById(R.id.progress)
                   overallText = findViewById(R.id.overallPercent)
                   status = findViewById(R.id.status)
                   playlistCheck = findViewById(R.id.playlistCheck)
+                  skipCheck = findViewById(R.id.skipCheck)
+                  val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+                  skipCheck.isChecked = prefs.getBoolean("skip", true)
+                  skipCheck.setOnCheckedChangeListener { _, checked ->
+                      prefs.edit().putBoolean("skip", checked).apply()
+                  }
                   resultCard = findViewById(R.id.resultCard)
                   listCard = findViewById(R.id.listCard)
                   songList = findViewById(R.id.songList)
@@ -540,10 +668,17 @@ jobs:
                   findViewById<Button>(R.id.pasteBtn).setOnClickListener {
                       val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
                       val text = cm.primaryClip?.getItemAt(0)?.text?.toString()
-                      if (!text.isNullOrBlank()) input.setText(text.trim())
+                      if (!text.isNullOrBlank()) {
+                          val cur = input.text.toString().trimEnd()
+                          input.setText(if (cur.isEmpty()) text.trim() else cur + "\n" + text.trim())
+                          input.setSelection(input.text.length)
+                      }
                   }
 
+                  findViewById<Button>(R.id.clearBtn).setOnClickListener { input.setText("") }
+
                   convertBtn.setOnClickListener { onConvertClick() }
+                  addBtn.setOnClickListener { onAddClick() }
               }
 
               override fun onResume() {
@@ -577,23 +712,46 @@ jobs:
 
               private fun setStatus(msg: String) = runOnUiThread { status.text = msg }
 
+              private fun parseUrls(): List<String> {
+                  return input.text.toString()
+                      .split(Regex("""\s+"""))
+                      .map { it.trim() }
+                      .filter { it.startsWith("http", ignoreCase = true) }
+                      .distinct()
+              }
+
+              // Adaugă linkuri noi în coadă, fără să oprească conversia curentă.
+              private fun onAddClick() {
+                  val urls = parseUrls()
+                  if (urls.isEmpty()) { setStatus("Nu am găsit niciun link (trebuie să înceapă cu http)."); return }
+                  val i = Intent(this, ConvertService::class.java)
+                      .putStringArrayListExtra(ConvertService.EXTRA_URLS, ArrayList(urls))
+                      .putExtra(ConvertService.EXTRA_PLAYLIST, playlistCheck.isChecked)
+                      .putExtra(ConvertService.EXTRA_SKIP, skipCheck.isChecked)
+                  ContextCompat.startForegroundService(this, i)
+                  input.setText("")
+                  JobState.message = "Se adaugă în coadă..."
+                  render()
+              }
+
               private fun onConvertClick() {
                   if (JobState.running) {
                       startService(Intent(this, ConvertService::class.java).setAction(ConvertService.ACTION_STOP))
                       return
                   }
-                  val url = input.text.toString().trim()
-                  if (url.isEmpty()) { setStatus("Introdu un link."); return }
+                  val urls = parseUrls()
+                  if (urls.isEmpty()) { setStatus("Nu am găsit niciun link (trebuie să înceapă cu http)."); return }
                   if (!ready) { setStatus("Încă se inițializează, mai așteaptă puțin."); return }
 
-                  JobState.items = emptyList()
+                  JobState.items = CopyOnWriteArrayList()
                   JobState.current = -1
                   JobState.message = "Se citește lista..."
                   JobState.running = true
 
                   val i = Intent(this, ConvertService::class.java)
-                      .putExtra(ConvertService.EXTRA_URL, url)
+                      .putStringArrayListExtra(ConvertService.EXTRA_URLS, ArrayList(urls))
                       .putExtra(ConvertService.EXTRA_PLAYLIST, playlistCheck.isChecked)
+                      .putExtra(ConvertService.EXTRA_SKIP, skipCheck.isChecked)
                   ContextCompat.startForegroundService(this, i)
                   render()
               }
@@ -633,6 +791,7 @@ jobs:
                   val items = JobState.items
                   val running = JobState.running
                   convertBtn.text = if (running) "STOP" else "CONVERT"
+                  addBtn.visibility = if (running) View.VISIBLE else View.GONE
                   if (JobState.message.isNotEmpty()) status.text = JobState.message
 
                   if (!running && items.isEmpty()) {
@@ -646,15 +805,17 @@ jobs:
                   if (renderedFor !== items) {
                       songList.removeAllViews()
                       rows.clear()
-                      for (item in items) {
-                          val v = layoutInflater.inflate(R.layout.item_song, songList, false)
-                          v.findViewById<TextView>(R.id.rowTitle).text = item.title
-                          loadThumb("https://i.ytimg.com/vi/" + item.id + "/default.jpg", v.findViewById(R.id.rowThumb))
-                          rows.add(Row(v.findViewById(R.id.rowBar), v.findViewById(R.id.rowState)))
-                          songList.addView(v)
-                      }
                       renderedFor = items
                       bigShownId = ""
+                  }
+                  // Adaugă rânduri doar pentru melodiile noi (coada poate crește în timpul conversiei).
+                  while (rows.size < items.size) {
+                      val item = items[rows.size]
+                      val v = layoutInflater.inflate(R.layout.item_song, songList, false)
+                      v.findViewById<TextView>(R.id.rowTitle).text = item.title
+                      loadThumb("https://i.ytimg.com/vi/" + item.id + "/default.jpg", v.findViewById(R.id.rowThumb))
+                      rows.add(Row(v.findViewById(R.id.rowBar), v.findViewById(R.id.rowState)))
+                      songList.addView(v)
                   }
 
                   for ((i, item) in items.withIndex()) {
@@ -675,6 +836,11 @@ jobs:
                               r.state.text = "GATA"
                               r.state.setTextColor(getColor(R.color.cyan))
                               r.bar.progress = 100
+                          }
+                          SongItem.SKIPPED -> {
+                              r.state.text = "EXISTĂ"
+                              r.state.setTextColor(getColor(R.color.violet))
+                              r.bar.progress = 0
                           }
                           SongItem.ERROR -> {
                               r.state.text = "EROARE"
@@ -1001,41 +1167,49 @@ jobs:
                       android:orientation="vertical"
                       android:padding="14dp">
 
+                      <EditText
+                          android:id="@+id/linkInput"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:background="@drawable/bg_input"
+                          android:fontFamily="monospace"
+                          android:gravity="top|start"
+                          android:hint="Linkuri YouTube (unul pe rând)"
+                          android:inputType="textMultiLine|textUri"
+                          android:maxLines="5"
+                          android:minHeight="48dp"
+                          android:padding="12dp"
+                          android:textColor="@color/text"
+                          android:textColorHint="@color/hint"
+                          android:textSize="13sp" />
+
                       <LinearLayout
                           android:layout_width="match_parent"
-                          android:layout_height="48dp"
-                          android:background="@drawable/bg_input"
-                          android:gravity="center_vertical"
-                          android:orientation="horizontal"
-                          android:paddingStart="12dp"
-                          android:paddingEnd="8dp">
-
-                          <EditText
-                              android:id="@+id/linkInput"
-                              android:layout_width="0dp"
-                              android:layout_height="match_parent"
-                              android:layout_weight="1"
-                              android:background="@null"
-                              android:fontFamily="monospace"
-                              android:hint="Link YouTube"
-                              android:inputType="textUri"
-                              android:maxLines="1"
-                              android:singleLine="true"
-                              android:textColor="@color/text"
-                              android:textColorHint="@color/hint"
-                              android:textSize="13sp" />
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="10dp"
+                          android:orientation="horizontal">
 
                           <Button
                               android:id="@+id/pasteBtn"
-                              android:layout_width="wrap_content"
-                              android:layout_height="34dp"
+                              android:layout_width="0dp"
+                              android:layout_height="38dp"
+                              android:layout_weight="1"
                               android:background="@drawable/bg_btn_paste"
-                              android:minWidth="0dp"
                               android:minHeight="0dp"
-                              android:paddingStart="12dp"
-                              android:paddingEnd="12dp"
                               android:text="PASTE"
                               android:textColor="@color/cyan"
+                              android:textSize="12sp" />
+
+                          <Button
+                              android:id="@+id/clearBtn"
+                              android:layout_width="0dp"
+                              android:layout_height="38dp"
+                              android:layout_marginStart="8dp"
+                              android:layout_weight="1"
+                              android:background="@drawable/bg_btn_paste"
+                              android:minHeight="0dp"
+                              android:text="ȘTERGE"
+                              android:textColor="@color/violet"
                               android:textSize="12sp" />
                       </LinearLayout>
 
@@ -1045,6 +1219,16 @@ jobs:
                           android:layout_height="wrap_content"
                           android:layout_marginTop="14dp"
                           android:text="Descarcă tot playlist-ul"
+                          android:textColor="@color/text2"
+                          android:textSize="14sp" />
+
+                      <androidx.appcompat.widget.SwitchCompat
+                          android:id="@+id/skipCheck"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="10dp"
+                          android:checked="true"
+                          android:text="Sari peste melodiile deja descărcate"
                           android:textColor="@color/text2"
                           android:textSize="14sp" />
                   </LinearLayout>
@@ -1061,6 +1245,20 @@ jobs:
                       android:textColor="@color/on_cyan"
                       android:textSize="15sp"
                       android:textStyle="bold" />
+
+                  <Button
+                      android:id="@+id/addBtn"
+                      android:layout_width="match_parent"
+                      android:layout_height="46dp"
+                      android:layout_marginTop="10dp"
+                      android:background="@drawable/bg_btn_paste"
+                      android:fontFamily="monospace"
+                      android:letterSpacing="0.1"
+                      android:minHeight="0dp"
+                      android:text="+ ADAUGĂ ÎN COADĂ"
+                      android:textColor="@color/cyan"
+                      android:textSize="13sp"
+                      android:visibility="gone" />
 
                   <LinearLayout
                       android:id="@+id/resultCard"
