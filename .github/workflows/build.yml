@@ -163,12 +163,14 @@ jobs:
                   const val EXTRA_URLS = "urls"
                   const val EXTRA_PLAYLIST = "playlist"
                   const val EXTRA_SKIP = "skip"
+                  const val EXTRA_WORKERS = "workers"
                   const val ACTION_STOP = "com.example.ytmp3.STOP"
                   const val CHANNEL = "convert"
                   const val NOTIF_ID = 1
                   const val DONE_NOTIF_ID = 2
                   const val PROCESS_ID = "tdg_convert"
                   const val LIST_PROCESS_ID = "tdg_list"
+                  const val MAX_WORKERS = 4
                   @Volatile var working = false
               }
 
@@ -181,19 +183,20 @@ jobs:
 
               override fun onBind(intent: Intent?): IBinder? = null
 
+              private fun killProcess(id: String) {
+                  try {
+                      YoutubeDL.getInstance().destroyProcessById(id)
+                  } catch (e: Throwable) {
+                      // nu e nimic de oprit
+                  }
+              }
+
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent?.action == ACTION_STOP) {
                       cancelled = true
-                      try {
-                          YoutubeDL.getInstance().destroyProcessById(PROCESS_ID)
-                      } catch (e: Throwable) {
-                          // nu e nimic de oprit
-                      }
-                      try {
-                          YoutubeDL.getInstance().destroyProcessById(LIST_PROCESS_ID)
-                      } catch (e: Throwable) {
-                          // nu e nimic de oprit
-                      }
+                      killProcess(PROCESS_ID)
+                      killProcess(LIST_PROCESS_ID)
+                      for (w in 0 until MAX_WORKERS) killProcess(PROCESS_ID + "_" + w)
                       if (!working) {
                           JobState.running = false
                           JobState.changed()
@@ -212,6 +215,7 @@ jobs:
                   val urls = intent?.getStringArrayListExtra(EXTRA_URLS)
                   val playlist = intent?.getBooleanExtra(EXTRA_PLAYLIST, false) ?: false
                   val skip = intent?.getBooleanExtra(EXTRA_SKIP, true) ?: true
+                  val workers = (intent?.getIntExtra(EXTRA_WORKERS, 3) ?: 3).coerceIn(1, MAX_WORKERS)
                   if (urls == null || urls.isEmpty()) {
                       if (!working) stopSelf()
                       return START_NOT_STICKY
@@ -228,7 +232,7 @@ jobs:
                   cancelled = false
                   skipDup = skip
                   working = true
-                  Thread { runJob(urls, playlist) }.start()
+                  Thread { runJob(urls, playlist, workers) }.start()
                   return START_NOT_STICKY
               }
 
@@ -277,7 +281,10 @@ jobs:
                   val list = JobState.items
                   val idx = JobState.current
                   val text = if (idx in list.indices) {
-                      "" + (idx + 1) + "/" + list.size + " · " + list[idx].title
+                      val done = list.count {
+                          it.state == SongItem.DONE || it.state == SongItem.ERROR || it.state == SongItem.SKIPPED
+                      }
+                      "" + done + "/" + list.size + " · " + list[idx].title
                   } else {
                       JobState.message
                   }
@@ -318,14 +325,14 @@ jobs:
                   }
               }
 
-              private fun runJob(urls: List<String>, playlist: Boolean) {
+              private fun runJob(urls: List<String>, playlist: Boolean, workers: Int) {
                   val pm = getSystemService(POWER_SERVICE) as PowerManager
                   val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ytmp3:job")
                   wl.acquire(6 * 60 * 60 * 1000L)
                   val dir = File(cacheDir, "dl")
-                  var saved = 0
-                  var failed = 0
-                  var skipped = 0
+                  val savedC = AtomicInteger(0)
+                  val failedC = AtomicInteger(0)
+                  val skippedC = AtomicInteger(0)
                   var finalMsg = ""
                   try {
                       YoutubeDL.getInstance().init(application)
@@ -361,49 +368,76 @@ jobs:
                           throw Exception("Nu am găsit nicio melodie la linkurile date")
                       }
 
-                      JobState.message = "Se descarcă " + list.size + " melodie(i)..."
+                      JobState.message = "Se descarcă " + list.size + " melodie(i), câte " + workers + " odată..."
                       push()
 
-                      // Procesează lista pe rând. Linkurile adăugate între timp apar la final.
-                      var index = 0
-                      while (!cancelled) {
-                          if (index < list.size) {
-                              val item = list[index]
-                              if (item.state == SongItem.SKIPPED) {
-                                  skipped++
-                                  index++
-                                  JobState.changed()
-                                  continue
-                              }
-                              JobState.current = index
-                              item.state = SongItem.DOWNLOADING
-                              item.percent = 0
-                              push()
-                              try {
-                                  dir.deleteRecursively()
-                                  dir.mkdirs()
-                                  downloadOne(item, dir)
-                                  item.state = SongItem.DONE
-                                  item.percent = 100
-                                  saved++
-                              } catch (e: Exception) {
-                                  if (cancelled) {
-                                      item.state = SongItem.WAITING
-                                      item.percent = 0
-                                      break
+                      // Mai mulți lucrători iau melodii din aceeași listă, în paralel.
+                      // Linkurile adăugate între timp apar la final și sunt preluate automat.
+                      val nextIdx = AtomicInteger(0)
+                      val active = AtomicInteger(0)
+                      val claimLock = Any()
+                      val threads = ArrayList<Thread>()
+                      for (w in 0 until workers) {
+                          val t = Thread {
+                              val wdir = File(dir, "w" + w)
+                              while (!cancelled) {
+                                  var claim = -1
+                                  var finished = false
+                                  synchronized(claimLock) {
+                                      if (nextIdx.get() < list.size) {
+                                          claim = nextIdx.getAndIncrement()
+                                          active.incrementAndGet()
+                                      } else if (pendingListings.get() == 0 && active.get() == 0) {
+                                          finished = true
+                                      }
                                   }
-                                  item.state = SongItem.ERROR
-                                  failed++
+                                  if (claim >= 0) {
+                                      val item = list[claim]
+                                      try {
+                                          if (item.state == SongItem.SKIPPED) {
+                                              skippedC.incrementAndGet()
+                                              JobState.changed()
+                                          } else {
+                                              JobState.current = claim
+                                              item.state = SongItem.DOWNLOADING
+                                              item.percent = 0
+                                              push()
+                                              try {
+                                                  wdir.deleteRecursively()
+                                                  wdir.mkdirs()
+                                                  downloadOne(item, wdir, PROCESS_ID + "_" + w)
+                                                  item.state = SongItem.DONE
+                                                  item.percent = 100
+                                                  savedC.incrementAndGet()
+                                              } catch (e: Exception) {
+                                                  if (cancelled) {
+                                                      item.state = SongItem.WAITING
+                                                      item.percent = 0
+                                                  } else {
+                                                      item.state = SongItem.ERROR
+                                                      failedC.incrementAndGet()
+                                                  }
+                                              }
+                                              push()
+                                          }
+                                      } finally {
+                                          active.decrementAndGet()
+                                      }
+                                  } else if (finished) {
+                                      break
+                                  } else {
+                                      Thread.sleep(300)
+                                  }
                               }
-                              push()
-                              index++
-                          } else if (pendingListings.get() > 0) {
-                              Thread.sleep(300)
-                          } else {
-                              break
                           }
+                          threads.add(t)
+                          t.start()
                       }
+                      for (t in threads) t.join()
 
+                      val saved = savedC.get()
+                      val failed = failedC.get()
+                      val skipped = skippedC.get()
                       val bad = if (badLinks.get() > 0) " · " + badLinks.get() + " link(uri) nevalide" else ""
                       val sk = if (skipped > 0) ", " + skipped + " sărite (existau deja)" else ""
                       finalMsg = when {
@@ -447,17 +481,20 @@ jobs:
                   return result
               }
 
-              private fun downloadOne(item: SongItem, dir: File) {
+              private fun downloadOne(item: SongItem, dir: File, processId: String) {
                   val req = YoutubeDLRequest("https://www.youtube.com/watch?v=" + item.id)
                   req.addOption("--no-playlist")
                   req.addOption("-f", "bestaudio/best")
                   req.addOption("-x")
                   req.addOption("--audio-format", "mp3")
                   req.addOption("--audio-quality", "0")
+                  req.addOption("-N", "4")
+                  req.addOption("--throttled-rate", "100K")
+                  req.addOption("--retries", "5")
                   req.addOption("-o", dir.absolutePath + "/%(id)s.%(ext)s")
 
                   var lastPush = -10
-                  YoutubeDL.getInstance().execute(req, PROCESS_ID) { p, _, line ->
+                  YoutubeDL.getInstance().execute(req, processId) { p, _, line ->
                       if (line.contains("[ExtractAudio]")) {
                           if (item.state != SongItem.CONVERTING) {
                               item.state = SongItem.CONVERTING
@@ -586,6 +623,7 @@ jobs:
           import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.ProgressBar
+          import android.widget.SeekBar
           import android.widget.TextView
           import androidx.appcompat.app.AppCompatActivity
           import androidx.appcompat.widget.SwitchCompat
@@ -606,6 +644,8 @@ jobs:
               private lateinit var status: TextView
               private lateinit var playlistCheck: SwitchCompat
               private lateinit var skipCheck: SwitchCompat
+              private lateinit var workersSeek: SeekBar
+              private lateinit var workersLabel: TextView
               private lateinit var resultCard: View
               private lateinit var listCard: View
               private lateinit var songList: LinearLayout
@@ -639,6 +679,19 @@ jobs:
                   skipCheck.setOnCheckedChangeListener { _, checked ->
                       prefs.edit().putBoolean("skip", checked).apply()
                   }
+                  workersSeek = findViewById(R.id.workersSeek)
+                  workersLabel = findViewById(R.id.workersLabel)
+                  val w = prefs.getInt("workers", 3).coerceIn(1, 4)
+                  workersSeek.progress = w - 1
+                  workersLabel.text = "Descărcări simultane: " + w
+                  workersSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          workersLabel.text = "Descărcări simultane: " + (p + 1)
+                          prefs.edit().putInt("workers", p + 1).apply()
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
                   resultCard = findViewById(R.id.resultCard)
                   listCard = findViewById(R.id.listCard)
                   songList = findViewById(R.id.songList)
@@ -728,6 +781,7 @@ jobs:
                       .putStringArrayListExtra(ConvertService.EXTRA_URLS, ArrayList(urls))
                       .putExtra(ConvertService.EXTRA_PLAYLIST, playlistCheck.isChecked)
                       .putExtra(ConvertService.EXTRA_SKIP, skipCheck.isChecked)
+                      .putExtra(ConvertService.EXTRA_WORKERS, workersSeek.progress + 1)
                   ContextCompat.startForegroundService(this, i)
                   input.setText("")
                   JobState.message = "Se adaugă în coadă..."
@@ -752,6 +806,7 @@ jobs:
                       .putStringArrayListExtra(ConvertService.EXTRA_URLS, ArrayList(urls))
                       .putExtra(ConvertService.EXTRA_PLAYLIST, playlistCheck.isChecked)
                       .putExtra(ConvertService.EXTRA_SKIP, skipCheck.isChecked)
+                      .putExtra(ConvertService.EXTRA_WORKERS, workersSeek.progress + 1)
                   ContextCompat.startForegroundService(this, i)
                   render()
               }
@@ -859,7 +914,11 @@ jobs:
                   if (cur in items.indices) {
                       val s = items[cur]
                       songTitle.text = s.title
-                      songCounter.text = "MELODIA " + (cur + 1) + " / " + items.size
+                      val parallel = items.count {
+                          it.state == SongItem.DOWNLOADING || it.state == SongItem.CONVERTING
+                      }
+                      songCounter.text = "MELODIA " + (cur + 1) + " / " + items.size +
+                          (if (parallel > 1) " · " + parallel + " ÎN PARALEL" else "")
                       if (bigShownId != s.id) {
                           bigShownId = s.id
                           loadThumb("https://i.ytimg.com/vi/" + s.id + "/mqdefault.jpg", thumb)
@@ -1231,6 +1290,25 @@ jobs:
                           android:text="Sari peste melodiile deja descărcate"
                           android:textColor="@color/text2"
                           android:textSize="14sp" />
+
+                      <TextView
+                          android:id="@+id/workersLabel"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="14dp"
+                          android:text="Descărcări simultane: 3"
+                          android:textColor="@color/text2"
+                          android:textSize="14sp" />
+
+                      <SeekBar
+                          android:id="@+id/workersSeek"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="4dp"
+                          android:max="3"
+                          android:progress="2"
+                          android:progressTint="@color/cyan"
+                          android:thumbTint="@color/cyan" />
                   </LinearLayout>
 
                   <Button
