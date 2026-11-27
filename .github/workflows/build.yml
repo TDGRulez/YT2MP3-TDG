@@ -390,6 +390,7 @@ jobs:
                                       } else if (pendingListings.get() == 0 && active.get() == 0) {
                                           finished = true
                                       }
+                                      Unit
                                   }
                                   if (claim >= 0) {
                                       val item = list[claim]
