@@ -732,6 +732,8 @@ jobs:
 
                   convertBtn.setOnClickListener { onConvertClick() }
                   addBtn.setOnClickListener { onAddClick() }
+                  val scrollView = findViewById<android.widget.ScrollView>(R.id.scroll)
+                  findViewById<View>(R.id.topBtn).setOnClickListener { scrollView.smoothScrollTo(0, 0) }
               }
 
               override fun onResume() {
@@ -951,25 +953,33 @@ jobs:
               <stroke android:width="1dp" android:color="@color/stroke" />
           </shape>
           EOF_10
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_fab.xml")"
+          cat > "app/src/main/res/drawable/bg_fab.xml" <<'EOF_11'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="@color/card" />
+              <stroke android:width="1dp" android:color="@color/cyan" />
+          </shape>
+          EOF_11
           mkdir -p "$(dirname "app/src/main/res/drawable/bg_input.xml")"
-          cat > "app/src/main/res/drawable/bg_input.xml" <<'EOF_11'
+          cat > "app/src/main/res/drawable/bg_input.xml" <<'EOF_12'
           <?xml version="1.0" encoding="utf-8"?>
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
               <solid android:color="@color/bg" />
               <corners android:radius="12dp" />
               <stroke android:width="1dp" android:color="@color/stroke_input" />
           </shape>
-          EOF_11
+          EOF_12
           mkdir -p "$(dirname "app/src/main/res/drawable/bg_thumb.xml")"
-          cat > "app/src/main/res/drawable/bg_thumb.xml" <<'EOF_12'
+          cat > "app/src/main/res/drawable/bg_thumb.xml" <<'EOF_13'
           <?xml version="1.0" encoding="utf-8"?>
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
               <solid android:color="@color/stroke" />
               <corners android:radius="10dp" />
           </shape>
-          EOF_12
+          EOF_13
           mkdir -p "$(dirname "app/src/main/res/drawable/btn_convert.xml")"
-          cat > "app/src/main/res/drawable/btn_convert.xml" <<'EOF_13'
+          cat > "app/src/main/res/drawable/btn_convert.xml" <<'EOF_14'
           <?xml version="1.0" encoding="utf-8"?>
           <selector xmlns:android="http://schemas.android.com/apk/res/android">
               <item android:state_enabled="false">
@@ -985,9 +995,32 @@ jobs:
                   </shape>
               </item>
           </selector>
-          EOF_13
+          EOF_14
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_arrow_up.xml")"
+          cat > "app/src/main/res/drawable/ic_arrow_up.xml" <<'EOF_15'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="18dp"
+              android:height="18dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M12,19 L12,5"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeWidth="2.4" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M5.5,11.5 L12,5 L18.5,11.5"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2.4" />
+          </vector>
+          EOF_15
           mkdir -p "$(dirname "app/src/main/res/drawable/ic_launcher_foreground.xml")"
-          cat > "app/src/main/res/drawable/ic_launcher_foreground.xml" <<'EOF_14'
+          cat > "app/src/main/res/drawable/ic_launcher_foreground.xml" <<'EOF_16'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -1026,9 +1059,9 @@ jobs:
                   android:strokeLineCap="round"
                   android:strokeWidth="4" />
           </vector>
-          EOF_14
+          EOF_16
           mkdir -p "$(dirname "app/src/main/res/drawable/ic_logo_mark.xml")"
-          cat > "app/src/main/res/drawable/ic_logo_mark.xml" <<'EOF_15'
+          cat > "app/src/main/res/drawable/ic_logo_mark.xml" <<'EOF_17'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="40dp"
@@ -1062,9 +1095,9 @@ jobs:
                   android:strokeLineCap="round"
                   android:strokeWidth="7" />
           </vector>
-          EOF_15
+          EOF_17
           mkdir -p "$(dirname "app/src/main/res/drawable/ic_notif.xml")"
-          cat > "app/src/main/res/drawable/ic_notif.xml" <<'EOF_16'
+          cat > "app/src/main/res/drawable/ic_notif.xml" <<'EOF_18'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="24dp"
@@ -1103,9 +1136,9 @@ jobs:
                   android:strokeLineCap="round"
                   android:strokeWidth="1.2" />
           </vector>
-          EOF_16
+          EOF_18
           mkdir -p "$(dirname "app/src/main/res/drawable/ic_play.xml")"
-          cat > "app/src/main/res/drawable/ic_play.xml" <<'EOF_17'
+          cat > "app/src/main/res/drawable/ic_play.xml" <<'EOF_19'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="24dp"
@@ -1116,9 +1149,9 @@ jobs:
                   android:fillColor="#A78BFA"
                   android:pathData="M8,5 L8,19 L19,12 Z" />
           </vector>
-          EOF_17
+          EOF_19
           mkdir -p "$(dirname "app/src/main/res/drawable/progress_bar.xml")"
-          cat > "app/src/main/res/drawable/progress_bar.xml" <<'EOF_18'
+          cat > "app/src/main/res/drawable/progress_bar.xml" <<'EOF_20'
           <?xml version="1.0" encoding="utf-8"?>
           <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
               <item android:id="@android:id/background">
@@ -1136,11 +1169,17 @@ jobs:
                   </clip>
               </item>
           </layer-list>
-          EOF_18
+          EOF_20
           mkdir -p "$(dirname "app/src/main/res/layout/activity_main.xml")"
-          cat > "app/src/main/res/layout/activity_main.xml" <<'EOF_19'
+          cat > "app/src/main/res/layout/activity_main.xml" <<'EOF_21'
           <?xml version="1.0" encoding="utf-8"?>
-          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@color/bg">
+
+          <ScrollView
+              android:id="@+id/scroll"
               android:layout_width="match_parent"
               android:layout_height="match_parent"
               android:background="@color/bg"
@@ -1460,9 +1499,24 @@ jobs:
                       android:textSize="12sp" />
               </LinearLayout>
           </ScrollView>
-          EOF_19
+
+          <ImageButton
+              android:id="@+id/topBtn"
+              android:layout_width="40dp"
+              android:layout_height="40dp"
+              android:layout_gravity="bottom|start"
+              android:layout_marginStart="14dp"
+              android:layout_marginBottom="16dp"
+              android:background="@drawable/bg_fab"
+              android:contentDescription="Sus"
+              android:elevation="4dp"
+              android:scaleType="center"
+              android:src="@drawable/ic_arrow_up" />
+
+          </FrameLayout>
+          EOF_21
           mkdir -p "$(dirname "app/src/main/res/layout/item_song.xml")"
-          cat > "app/src/main/res/layout/item_song.xml" <<'EOF_20'
+          cat > "app/src/main/res/layout/item_song.xml" <<'EOF_22'
           <?xml version="1.0" encoding="utf-8"?>
           <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="match_parent"
@@ -1518,25 +1572,25 @@ jobs:
                   android:textColor="@color/text2"
                   android:textSize="11sp" />
           </LinearLayout>
-          EOF_20
-          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml")"
-          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'EOF_21'
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/icon_bg" />
-              <foreground android:drawable="@drawable/ic_launcher_foreground" />
-          </adaptive-icon>
-          EOF_21
-          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml")"
-          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" <<'EOF_22'
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/icon_bg" />
-              <foreground android:drawable="@drawable/ic_launcher_foreground" />
-          </adaptive-icon>
           EOF_22
+          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml")"
+          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'EOF_23'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF_23
+          mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml")"
+          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" <<'EOF_24'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF_24
           mkdir -p "$(dirname "app/src/main/res/values/colors.xml")"
-          cat > "app/src/main/res/values/colors.xml" <<'EOF_23'
+          cat > "app/src/main/res/values/colors.xml" <<'EOF_25'
           <resources>
               <color name="bg">#0A0C10</color>
               <color name="card">#12151B</color>
@@ -1551,15 +1605,15 @@ jobs:
               <color name="on_cyan">#04262B</color>
               <color name="icon_bg">#0A0C10</color>
           </resources>
-          EOF_23
+          EOF_25
           mkdir -p "$(dirname "app/src/main/res/values/strings.xml")"
-          cat > "app/src/main/res/values/strings.xml" <<'EOF_24'
+          cat > "app/src/main/res/values/strings.xml" <<'EOF_26'
           <resources>
               <string name="app_name">TDG YT2MP3 CONVERT</string>
           </resources>
-          EOF_24
+          EOF_26
           mkdir -p "$(dirname "app/src/main/res/values/themes.xml")"
-          cat > "app/src/main/res/values/themes.xml" <<'EOF_25'
+          cat > "app/src/main/res/values/themes.xml" <<'EOF_27'
           <resources>
               <style name="Theme.App" parent="Theme.AppCompat.NoActionBar">
                   <item name="colorPrimary">@color/cyan</item>
@@ -1574,7 +1628,7 @@ jobs:
                   <item name="android:textColorHint">@color/hint</item>
               </style>
           </resources>
-          EOF_25
+          EOF_27
 
       - uses: actions/setup-java@v4
         with:
