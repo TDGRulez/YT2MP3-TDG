@@ -129,6 +129,11 @@ jobs:
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
                   </activity>
               </application>
           </manifest>
@@ -164,6 +169,7 @@ jobs:
                   const val EXTRA_PLAYLIST = "playlist"
                   const val EXTRA_SKIP = "skip"
                   const val EXTRA_WORKERS = "workers"
+                  const val EXTRA_RETRY = "retry"
                   const val ACTION_STOP = "com.example.ytmp3.STOP"
                   const val CHANNEL = "convert"
                   const val NOTIF_ID = 1
@@ -215,6 +221,7 @@ jobs:
                   val urls = intent?.getStringArrayListExtra(EXTRA_URLS)
                   val playlist = intent?.getBooleanExtra(EXTRA_PLAYLIST, false) ?: false
                   val skip = intent?.getBooleanExtra(EXTRA_SKIP, true) ?: true
+                  val retry = intent?.getBooleanExtra(EXTRA_RETRY, false) ?: false
                   val workers = (intent?.getIntExtra(EXTRA_WORKERS, 3) ?: 3).coerceIn(1, MAX_WORKERS)
                   if (urls == null || urls.isEmpty()) {
                       if (!working) stopSelf()
@@ -225,14 +232,14 @@ jobs:
                       // O conversie rulează deja: adăugăm linkurile noi la finalul listei.
                       skipDup = skip
                       pendingListings.incrementAndGet()
-                      Thread { addUrls(urls, playlist) }.start()
+                      Thread { addUrls(urls, playlist, retry) }.start()
                       return START_NOT_STICKY
                   }
 
                   cancelled = false
                   skipDup = skip
                   working = true
-                  Thread { runJob(urls, playlist, workers) }.start()
+                  Thread { runJob(urls, playlist, workers, retry) }.start()
                   return START_NOT_STICKY
               }
 
@@ -281,10 +288,11 @@ jobs:
                   val list = JobState.items
                   val idx = JobState.current
                   val text = if (idx in list.indices) {
+                      val total = list.count { it.state != SongItem.REMOVED }
                       val done = list.count {
                           it.state == SongItem.DONE || it.state == SongItem.ERROR || it.state == SongItem.SKIPPED
                       }
-                      "" + done + "/" + list.size + " · " + list[idx].title
+                      "" + done + "/" + total + " · " + list[idx].title
                   } else {
                       JobState.message
                   }
@@ -293,8 +301,18 @@ jobs:
                       .notify(NOTIF_ID, buildNotif(text, pct, list.isEmpty()))
               }
 
+              // La reîncercare, o melodie poate fi adăugată din nou chiar dacă a mai fost în listă.
+              private fun register(id: String, force: Boolean): Boolean {
+                  return if (force) {
+                      seen.add(id)
+                      true
+                  } else {
+                      seen.add(id)
+                  }
+              }
+
               // Adaugă linkuri noi în timp ce conversia curentă continuă.
-              private fun addUrls(urls: List<String>, playlist: Boolean) {
+              private fun addUrls(urls: List<String>, playlist: Boolean, force: Boolean) {
                   var added = 0
                   try {
                       synchronized(listLock) {
@@ -302,7 +320,7 @@ jobs:
                               if (cancelled) break
                               try {
                                   for (s in fetchList(u, playlist, LIST_PROCESS_ID)) {
-                                      if (seen.add(s.id)) {
+                                      if (register(s.id, force)) {
                                           if (skipDup && alreadyDownloaded(s.id)) s.state = SongItem.SKIPPED
                                           JobState.items.add(s)
                                           added++
@@ -325,7 +343,7 @@ jobs:
                   }
               }
 
-              private fun runJob(urls: List<String>, playlist: Boolean, workers: Int) {
+              private fun runJob(urls: List<String>, playlist: Boolean, workers: Int, force: Boolean) {
                   val pm = getSystemService(POWER_SERVICE) as PowerManager
                   val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ytmp3:job")
                   wl.acquire(6 * 60 * 60 * 1000L)
@@ -353,7 +371,7 @@ jobs:
                           push()
                           try {
                               for (s in fetchList(u, playlist, PROCESS_ID)) {
-                                  if (seen.add(s.id)) {
+                                  if (register(s.id, force)) {
                                       if (skipDup && alreadyDownloaded(s.id)) s.state = SongItem.SKIPPED
                                       list.add(s)
                                   }
@@ -395,12 +413,12 @@ jobs:
                                   if (claim >= 0) {
                                       val item = list[claim]
                                       try {
-                                          if (item.state == SongItem.SKIPPED) {
+                                          val st = item.state
+                                          if (st == SongItem.SKIPPED) {
                                               skippedC.incrementAndGet()
                                               JobState.changed()
-                                          } else {
+                                          } else if (item.tryChange(SongItem.WAITING, SongItem.DOWNLOADING)) {
                                               JobState.current = claim
-                                              item.state = SongItem.DOWNLOADING
                                               item.percent = 0
                                               push()
                                               try {
@@ -420,6 +438,9 @@ jobs:
                                                   }
                                               }
                                               push()
+                                          } else {
+                                              // eliminată din coadă între timp
+                                              JobState.changed()
                                           }
                                       } finally {
                                           active.decrementAndGet()
@@ -482,13 +503,38 @@ jobs:
                   return result
               }
 
+              // Încearcă mai întâi cu titlu, artist și copertă în MP3; dacă eșuează, reia fără ele.
               private fun downloadOne(item: SongItem, dir: File, processId: String) {
+                  try {
+                      runDownload(item, dir, processId, true)
+                  } catch (e: Exception) {
+                      if (cancelled) throw e
+                      dir.deleteRecursively()
+                      dir.mkdirs()
+                      item.state = SongItem.DOWNLOADING
+                      item.percent = 0
+                      push()
+                      runDownload(item, dir, processId, false)
+                  }
+                  val mp3 = dir.listFiles()?.firstOrNull { it.extension == "mp3" }
+                      ?: throw Exception("Nu s-a generat MP3")
+                  val savedName = saveToMusic(mp3, item.title)
+                  getSharedPreferences("history", MODE_PRIVATE).edit()
+                      .putString("dl_" + item.id, savedName).apply()
+              }
+
+              private fun runDownload(item: SongItem, dir: File, processId: String, embed: Boolean) {
                   val req = YoutubeDLRequest("https://www.youtube.com/watch?v=" + item.id)
                   req.addOption("--no-playlist")
                   req.addOption("-f", "bestaudio/best")
                   req.addOption("-x")
                   req.addOption("--audio-format", "mp3")
                   req.addOption("--audio-quality", "0")
+                  if (embed) {
+                      req.addOption("--embed-metadata")
+                      req.addOption("--embed-thumbnail")
+                      req.addOption("--convert-thumbnails", "jpg")
+                  }
                   req.addOption("-N", "4")
                   req.addOption("--throttled-rate", "100K")
                   req.addOption("--retries", "5")
@@ -512,12 +558,6 @@ jobs:
                           }
                       }
                   }
-
-                  val mp3 = dir.listFiles()?.firstOrNull { it.extension == "mp3" }
-                      ?: throw Exception("Nu s-a generat MP3")
-                  val savedName = saveToMusic(mp3, item.title)
-                  getSharedPreferences("history", MODE_PRIVATE).edit()
-                      .putString("dl_" + item.id, savedName).apply()
               }
 
               // True dacă melodia a mai fost descărcată și fișierul încă există în Music/YT2MP3.
@@ -543,6 +583,8 @@ jobs:
                       .ifEmpty { "melodie" } + ".mp3"
                   val values = ContentValues().apply {
                       put(MediaStore.Audio.Media.DISPLAY_NAME, clean)
+                      put(MediaStore.Audio.Media.TITLE, title)
+                      put(MediaStore.Audio.Media.IS_MUSIC, 1)
                       put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
                       put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/YT2MP3")
                   }
@@ -562,10 +604,19 @@ jobs:
           import android.os.Handler
           import android.os.Looper
           import java.util.concurrent.CopyOnWriteArrayList
+          import java.util.concurrent.atomic.AtomicInteger
 
           class SongItem(val id: String, val title: String) {
-              @Volatile var state: Int = WAITING
+              private val stateRef = AtomicInteger(WAITING)
+
+              var state: Int
+                  get() = stateRef.get()
+                  set(v) { stateRef.set(v) }
+
               @Volatile var percent: Int = 0
+
+              // Schimbă starea doar dacă este încă cea așteptată (evită conflicte între interfață și lucrători).
+              fun tryChange(from: Int, to: Int): Boolean = stateRef.compareAndSet(from, to)
 
               companion object {
                   const val WAITING = 0
@@ -574,6 +625,7 @@ jobs:
                   const val DONE = 3
                   const val ERROR = 4
                   const val SKIPPED = 5
+                  const val REMOVED = 6
               }
           }
 
@@ -591,9 +643,11 @@ jobs:
 
               fun overallPercent(): Int {
                   val list = items
-                  if (list.isEmpty()) return 0
                   var sum = 0.0
+                  var count = 0
                   for (s in list) {
+                      if (s.state == SongItem.REMOVED) continue
+                      count++
                       sum += when (s.state) {
                           SongItem.DOWNLOADING -> s.percent * 0.9
                           SongItem.CONVERTING -> 95.0
@@ -601,7 +655,8 @@ jobs:
                           else -> 0.0
                       }
                   }
-                  return (sum / list.size).toInt().coerceIn(0, 100)
+                  if (count == 0) return 0
+                  return (sum / count).toInt().coerceIn(0, 100)
               }
           }
           EOF_7
@@ -612,50 +667,79 @@ jobs:
           import android.Manifest
           import android.content.ClipboardManager
           import android.content.Intent
+          import android.content.SharedPreferences
           import android.content.pm.PackageManager
           import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import android.os.Build
           import android.os.Bundle
+          import android.text.Editable
+          import android.text.TextWatcher
           import android.util.LruCache
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
           import android.view.View
-          import android.widget.Button
+          import android.view.ViewConfiguration
           import android.widget.EditText
           import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.ProgressBar
-          import android.widget.SeekBar
+          import android.widget.ScrollView
           import android.widget.TextView
           import androidx.appcompat.app.AppCompatActivity
-          import androidx.appcompat.widget.SwitchCompat
           import androidx.core.content.ContextCompat
           import com.yausername.ffmpeg.FFmpeg
           import com.yausername.youtubedl_android.YoutubeDL
           import java.net.URL
           import java.util.concurrent.CopyOnWriteArrayList
           import java.util.concurrent.Executors
+          import kotlin.math.abs
 
           class MainActivity : AppCompatActivity() {
 
+              private lateinit var scroll: ScrollView
               private lateinit var input: EditText
-              private lateinit var convertBtn: Button
-              private lateinit var addBtn: Button
-              private lateinit var progress: ProgressBar
-              private lateinit var overallText: TextView
+              private lateinit var clearBtn: View
+              private lateinit var chipPlaylist: TextView
+              private lateinit var chipSkip: TextView
+              private lateinit var chipWorkers: TextView
               private lateinit var status: TextView
-              private lateinit var playlistCheck: SwitchCompat
-              private lateinit var skipCheck: SwitchCompat
-              private lateinit var workersSeek: SeekBar
-              private lateinit var workersLabel: TextView
-              private lateinit var resultCard: View
-              private lateinit var listCard: View
-              private lateinit var songList: LinearLayout
+              private lateinit var emptyHint: TextView
+              private lateinit var heroCard: View
+              private lateinit var ring: RingProgressView
               private lateinit var thumb: ImageView
+              private lateinit var heroPercent: TextView
               private lateinit var songTitle: TextView
               private lateinit var songCounter: TextView
-              @Volatile private var ready = false
+              private lateinit var overallText: TextView
+              private lateinit var progress: ProgressBar
+              private lateinit var tabsBar: View
+              private lateinit var tabViews: List<TextView>
+              private lateinit var retryAll: TextView
+              private lateinit var songList: LinearLayout
+              private lateinit var mainBtn: TextView
+              private lateinit var addBtn: View
+              private lateinit var parallelPill: TextView
+              private lateinit var prefs: SharedPreferences
 
-              private class Row(val bar: ProgressBar, val state: TextView)
+              @Volatile private var ready = false
+              private var autoStart = false
+              private var filter = 0
+              private var playlistOn = false
+              private var skipOn = true
+              private var workers = 3
+
+              private class Row(
+                  val item: SongItem,
+                  val root: View,
+                  val fg: View,
+                  val bar: ProgressBar,
+                  val pill: TextView,
+                  val retry: ImageView
+              ) {
+                  var lastState = -1
+                  var lastPct = -1
+              }
 
               private val rows = ArrayList<Row>()
               private var renderedFor: List<SongItem>? = null
@@ -667,44 +751,118 @@ jobs:
                   super.onCreate(savedInstanceState)
                   setContentView(R.layout.activity_main)
 
+                  scroll = findViewById(R.id.scroll)
                   input = findViewById(R.id.linkInput)
-                  convertBtn = findViewById(R.id.convertBtn)
-                  addBtn = findViewById(R.id.addBtn)
-                  progress = findViewById(R.id.progress)
-                  overallText = findViewById(R.id.overallPercent)
+                  clearBtn = findViewById(R.id.clearBtn)
+                  chipPlaylist = findViewById(R.id.chipPlaylist)
+                  chipSkip = findViewById(R.id.chipSkip)
+                  chipWorkers = findViewById(R.id.chipWorkers)
                   status = findViewById(R.id.status)
-                  playlistCheck = findViewById(R.id.playlistCheck)
-                  skipCheck = findViewById(R.id.skipCheck)
-                  val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-                  skipCheck.isChecked = prefs.getBoolean("skip", true)
-                  skipCheck.setOnCheckedChangeListener { _, checked ->
-                      prefs.edit().putBoolean("skip", checked).apply()
-                  }
-                  workersSeek = findViewById(R.id.workersSeek)
-                  workersLabel = findViewById(R.id.workersLabel)
-                  val w = prefs.getInt("workers", 3).coerceIn(1, 4)
-                  workersSeek.progress = w - 1
-                  workersLabel.text = "Descărcări simultane: " + w
-                  workersSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                          workersLabel.text = "Descărcări simultane: " + (p + 1)
-                          prefs.edit().putInt("workers", p + 1).apply()
-                      }
-                      override fun onStartTrackingTouch(s: SeekBar?) {}
-                      override fun onStopTrackingTouch(s: SeekBar?) {}
-                  })
-                  resultCard = findViewById(R.id.resultCard)
-                  listCard = findViewById(R.id.listCard)
-                  songList = findViewById(R.id.songList)
+                  emptyHint = findViewById(R.id.emptyHint)
+                  heroCard = findViewById(R.id.heroCard)
+                  ring = findViewById(R.id.ring)
                   thumb = findViewById(R.id.thumb)
+                  heroPercent = findViewById(R.id.heroPercent)
                   songTitle = findViewById(R.id.songTitle)
                   songCounter = findViewById(R.id.songCounter)
+                  overallText = findViewById(R.id.overallPercent)
+                  progress = findViewById(R.id.progress)
+                  tabsBar = findViewById(R.id.tabsBar)
+                  retryAll = findViewById(R.id.retryAll)
+                  songList = findViewById(R.id.songList)
+                  mainBtn = findViewById(R.id.mainBtn)
+                  addBtn = findViewById(R.id.addBtn)
+                  parallelPill = findViewById(R.id.parallelPill)
+                  tabViews = listOf(
+                      findViewById<TextView>(R.id.tabAll),
+                      findViewById<TextView>(R.id.tabActive),
+                      findViewById<TextView>(R.id.tabDone),
+                      findViewById<TextView>(R.id.tabErrors)
+                  )
+
+                  prefs = getSharedPreferences("settings", MODE_PRIVATE)
+                  playlistOn = prefs.getBoolean("playlist", false)
+                  skipOn = prefs.getBoolean("skip", true)
+                  workers = prefs.getInt("workers", 3).coerceIn(1, 4)
+                  applyChips()
+
+                  chipPlaylist.setOnClickListener {
+                      haptic(it)
+                      playlistOn = !playlistOn
+                      prefs.edit().putBoolean("playlist", playlistOn).apply()
+                      applyChips()
+                  }
+                  chipSkip.setOnClickListener {
+                      haptic(it)
+                      skipOn = !skipOn
+                      prefs.edit().putBoolean("skip", skipOn).apply()
+                      applyChips()
+                  }
+                  chipWorkers.setOnClickListener {
+                      haptic(it)
+                      workers = workers % 4 + 1
+                      prefs.edit().putInt("workers", workers).apply()
+                      applyChips()
+                  }
+
+                  for ((i, t) in tabViews.withIndex()) {
+                      t.setOnClickListener {
+                          haptic(it)
+                          filter = i
+                          render()
+                      }
+                  }
+
+                  input.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                      override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                      override fun afterTextChanged(s: Editable?) {
+                          clearBtn.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+                      }
+                  })
+                  clearBtn.setOnClickListener {
+                      haptic(it)
+                      input.setText("")
+                  }
+                  findViewById<View>(R.id.pasteBtn).setOnClickListener {
+                      haptic(it)
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                      val text = cm.primaryClip?.getItemAt(0)?.text?.toString()
+                      if (!text.isNullOrBlank()) {
+                          val cur = input.text.toString().trimEnd()
+                          input.setText(if (cur.isEmpty()) text.trim() else cur + "\n" + text.trim())
+                          input.setSelection(input.text.length)
+                      }
+                  }
+                  findViewById<View>(R.id.topBtn).setOnClickListener {
+                      haptic(it)
+                      scroll.smoothScrollTo(0, 0)
+                  }
+                  mainBtn.setOnClickListener {
+                      haptic(it)
+                      onMainClick()
+                  }
+                  addBtn.setOnClickListener {
+                      haptic(it)
+                      onAddClick()
+                  }
+                  retryAll.setOnClickListener {
+                      haptic(it)
+                      onRetry(JobState.items.filter { s -> s.state == SongItem.ERROR })
+                  }
+
+                  for (v in listOf(findViewById<View>(R.id.pasteBtn), findViewById<View>(R.id.topBtn),
+                      mainBtn, addBtn, chipPlaylist, chipSkip, chipWorkers, retryAll)) {
+                      pressable(v)
+                  }
 
                   if (Build.VERSION.SDK_INT >= 33 &&
                       checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                   ) {
                       requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
                   }
+
+                  handleIntent(intent)
 
                   Thread {
                       try {
@@ -714,27 +872,22 @@ jobs:
                           updateYtDlp()
                           ready = true
                           if (!JobState.running) setStatus("Gata. Lipește un link.")
+                          if (autoStart) {
+                              runOnUiThread {
+                                  autoStart = false
+                                  onMainClick()
+                              }
+                          }
                       } catch (e: Exception) {
                           setStatus("Eroare inițializare: ${e.message}")
                       }
                   }.start()
+              }
 
-                  findViewById<Button>(R.id.pasteBtn).setOnClickListener {
-                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-                      val text = cm.primaryClip?.getItemAt(0)?.text?.toString()
-                      if (!text.isNullOrBlank()) {
-                          val cur = input.text.toString().trimEnd()
-                          input.setText(if (cur.isEmpty()) text.trim() else cur + "\n" + text.trim())
-                          input.setSelection(input.text.length)
-                      }
-                  }
-
-                  findViewById<Button>(R.id.clearBtn).setOnClickListener { input.setText("") }
-
-                  convertBtn.setOnClickListener { onConvertClick() }
-                  addBtn.setOnClickListener { onAddClick() }
-                  val scrollView = findViewById<android.widget.ScrollView>(R.id.scroll)
-                  findViewById<View>(R.id.topBtn).setOnClickListener { scrollView.smoothScrollTo(0, 0) }
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleIntent(intent)
               }
 
               override fun onResume() {
@@ -746,6 +899,26 @@ jobs:
               override fun onPause() {
                   super.onPause()
                   JobState.listener = null
+              }
+
+              // Linkuri primite din „Distribuie” în aplicația YouTube.
+              private fun handleIntent(i: Intent?) {
+                  if (i == null || i.action != Intent.ACTION_SEND) return
+                  val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
+                  val urls = parseUrls(text)
+                  setIntent(Intent())
+                  if (urls.isEmpty()) return
+                  if (JobState.running) {
+                      submit(urls, false)
+                  } else {
+                      input.setText(urls.joinToString("\n"))
+                      if (ready) {
+                          onMainClick()
+                      } else {
+                          autoStart = true
+                          setStatus("Link primit. Pornesc imediat ce e gata...")
+                      }
+                  }
               }
 
               // Actualizează yt-dlp la ultima versiune stabilă (YouTube se schimbă des).
@@ -766,50 +939,95 @@ jobs:
                   }
               }
 
-              private fun setStatus(msg: String) = runOnUiThread { status.text = msg }
-
-              private fun parseUrls(): List<String> {
-                  return input.text.toString()
-                      .split(Regex("""\s+"""))
-                      .map { it.trim() }
-                      .filter { it.startsWith("http", ignoreCase = true) }
-                      .distinct()
+              private fun setStatus(msg: String) {
+                  JobState.message = msg
+                  runOnUiThread { status.text = msg }
               }
 
-              // Adaugă linkuri noi în coadă, fără să oprească conversia curentă.
-              private fun onAddClick() {
-                  val urls = parseUrls()
-                  if (urls.isEmpty()) { setStatus("Nu am găsit niciun link (trebuie să înceapă cu http)."); return }
-                  val i = Intent(this, ConvertService::class.java)
-                      .putStringArrayListExtra(ConvertService.EXTRA_URLS, ArrayList(urls))
-                      .putExtra(ConvertService.EXTRA_PLAYLIST, playlistCheck.isChecked)
-                      .putExtra(ConvertService.EXTRA_SKIP, skipCheck.isChecked)
-                      .putExtra(ConvertService.EXTRA_WORKERS, workersSeek.progress + 1)
-                  ContextCompat.startForegroundService(this, i)
-                  input.setText("")
-                  JobState.message = "Se adaugă în coadă..."
-                  render()
+              private fun haptic(v: View) {
+                  v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
               }
 
-              private fun onConvertClick() {
+              // Efect de apăsare: butonul se micșorează puțin cât ții degetul pe el.
+              private fun pressable(v: View) {
+                  v.setOnTouchListener { view, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN ->
+                              view.animate().scaleX(0.94f).scaleY(0.94f).setDuration(80).start()
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                              view.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                      }
+                      false
+                  }
+              }
+
+              private fun setChip(v: TextView, on: Boolean) {
+                  v.setBackgroundResource(if (on) R.drawable.bg_chip_on else R.drawable.bg_chip_off)
+                  v.setTextColor(getColor(if (on) R.color.cyan else R.color.text2))
+                  v.setCompoundDrawablesWithIntrinsicBounds(if (on) R.drawable.ic_check_small else 0, 0, 0, 0)
+              }
+
+              private fun applyChips() {
+                  setChip(chipPlaylist, playlistOn)
+                  setChip(chipSkip, skipOn)
+                  chipWorkers.text = "Simultan ×" + workers
+              }
+
+              private fun parseUrls(text: String): List<String> {
+                  return Regex("""https?://\S+""").findAll(text).map { it.value }.distinct().toList()
+              }
+
+              private fun onMainClick() {
                   if (JobState.running) {
                       startService(Intent(this, ConvertService::class.java).setAction(ConvertService.ACTION_STOP))
                       return
                   }
-                  val urls = parseUrls()
-                  if (urls.isEmpty()) { setStatus("Nu am găsit niciun link (trebuie să înceapă cu http)."); return }
-                  if (!ready) { setStatus("Încă se inițializează, mai așteaptă puțin."); return }
+                  val urls = parseUrls(input.text.toString())
+                  if (urls.isEmpty()) {
+                      setStatus("Nu am găsit niciun link (trebuie să înceapă cu http).")
+                      return
+                  }
+                  if (!ready) {
+                      setStatus("Încă se inițializează, mai așteaptă puțin.")
+                      return
+                  }
+                  submit(urls, false)
+              }
 
-                  JobState.items = CopyOnWriteArrayList()
-                  JobState.current = -1
-                  JobState.message = "Se citește lista..."
-                  JobState.running = true
+              // Adaugă linkuri noi în coadă, fără să oprească conversia curentă.
+              private fun onAddClick() {
+                  val urls = parseUrls(input.text.toString())
+                  if (urls.isEmpty()) {
+                      setStatus("Nu am găsit niciun link (trebuie să înceapă cu http).")
+                      return
+                  }
+                  submit(urls, false)
+                  input.setText("")
+              }
 
+              // Reîncearcă melodiile cu eroare (rândul vechi dispare, cel nou apare la final).
+              private fun onRetry(list: List<SongItem>) {
+                  val toRetry = list.filter { it.tryChange(SongItem.ERROR, SongItem.REMOVED) }
+                  if (toRetry.isEmpty()) return
+                  val urls = toRetry.map { "https://www.youtube.com/watch?v=" + it.id }
+                  submit(urls, true)
+              }
+
+              private fun submit(urls: List<String>, retry: Boolean) {
+                  if (!JobState.running) {
+                      JobState.items = CopyOnWriteArrayList()
+                      JobState.current = -1
+                      JobState.message = "Se citește lista..."
+                      JobState.running = true
+                  } else {
+                      JobState.message = "Se adaugă în coadă..."
+                  }
                   val i = Intent(this, ConvertService::class.java)
                       .putStringArrayListExtra(ConvertService.EXTRA_URLS, ArrayList(urls))
-                      .putExtra(ConvertService.EXTRA_PLAYLIST, playlistCheck.isChecked)
-                      .putExtra(ConvertService.EXTRA_SKIP, skipCheck.isChecked)
-                      .putExtra(ConvertService.EXTRA_WORKERS, workersSeek.progress + 1)
+                      .putExtra(ConvertService.EXTRA_PLAYLIST, playlistOn)
+                      .putExtra(ConvertService.EXTRA_SKIP, skipOn)
+                      .putExtra(ConvertService.EXTRA_WORKERS, workers)
+                      .putExtra(ConvertService.EXTRA_RETRY, retry)
                   ContextCompat.startForegroundService(this, i)
                   render()
               }
@@ -845,20 +1063,131 @@ jobs:
                   }
               }
 
+              // Tragi un rând în lateral ca să-l scoți din coadă (doar cât așteaptă).
+              private inner class SwipeTouch(private val row: Row) : View.OnTouchListener {
+                  private var downX = 0f
+                  private var downY = 0f
+                  private var dragging = false
+                  private val slop = ViewConfiguration.get(this@MainActivity).scaledTouchSlop
+                  private val maxPx = 160f * resources.displayMetrics.density
+                  private val thresholdPx = 90f * resources.displayMetrics.density
+
+                  override fun onTouch(v: View, e: MotionEvent): Boolean {
+                      if (row.item.state != SongItem.WAITING && !dragging) return false
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX
+                              downY = e.rawY
+                              dragging = false
+                              return true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - downX
+                              val dy = e.rawY - downY
+                              if (!dragging && abs(dx) > slop && abs(dx) > abs(dy)) {
+                                  dragging = true
+                                  v.parent?.requestDisallowInterceptTouchEvent(true)
+                              }
+                              if (dragging) v.translationX = dx.coerceIn(-maxPx, 0f)
+                              return true
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              if (dragging) {
+                                  val dx = v.translationX
+                                  if (e.actionMasked == MotionEvent.ACTION_UP && dx <= -thresholdPx &&
+                                      row.item.tryChange(SongItem.WAITING, SongItem.REMOVED)
+                                  ) {
+                                      haptic(v)
+                                      row.root.animate().alpha(0f).setDuration(150)
+                                          .withEndAction { JobState.changed() }.start()
+                                  } else {
+                                      v.animate().translationX(0f).setDuration(150).start()
+                                  }
+                              }
+                              dragging = false
+                              return true
+                          }
+                      }
+                      return false
+                  }
+              }
+
+              private fun addRow(item: SongItem) {
+                  val root = layoutInflater.inflate(R.layout.item_song, songList, false)
+                  val fg = root.findViewById<View>(R.id.rowFg)
+                  val thumbView = root.findViewById<ImageView>(R.id.rowThumb)
+                  val titleView = root.findViewById<TextView>(R.id.rowTitle)
+                  val bar = root.findViewById<ProgressBar>(R.id.rowBar)
+                  val pill = root.findViewById<TextView>(R.id.rowPill)
+                  val retry = root.findViewById<ImageView>(R.id.rowRetry)
+                  titleView.text = item.title
+                  loadThumb("https://i.ytimg.com/vi/" + item.id + "/default.jpg", thumbView)
+                  val row = Row(item, root, fg, bar, pill, retry)
+                  retry.setOnClickListener {
+                      haptic(it)
+                      onRetry(listOf(item))
+                  }
+                  fg.setOnTouchListener(SwipeTouch(row))
+                  root.alpha = 0f
+                  songList.addView(root)
+                  root.animate().alpha(1f).setDuration(200).start()
+                  rows.add(row)
+              }
+
+              private fun matchesFilter(s: Int): Boolean {
+                  return when (filter) {
+                      0 -> s != SongItem.REMOVED
+                      1 -> s == SongItem.DOWNLOADING || s == SongItem.CONVERTING
+                      2 -> s == SongItem.DONE || s == SongItem.SKIPPED
+                      else -> s == SongItem.ERROR
+                  }
+              }
+
+              private fun stylePill(r: Row, s: Int, pct: Int) {
+                  when (s) {
+                      SongItem.DOWNLOADING -> {
+                          r.pill.text = pct.toString() + "%"
+                          r.pill.setBackgroundResource(R.drawable.bg_pill_active)
+                          r.pill.setTextColor(getColor(R.color.cyan))
+                      }
+                      SongItem.CONVERTING -> {
+                          r.pill.text = "CONVERSIE"
+                          r.pill.setBackgroundResource(R.drawable.bg_pill_exists)
+                          r.pill.setTextColor(getColor(R.color.violet))
+                      }
+                      SongItem.DONE -> {
+                          r.pill.text = "GATA"
+                          r.pill.setBackgroundResource(R.drawable.bg_pill_done)
+                          r.pill.setTextColor(getColor(R.color.cyan))
+                      }
+                      SongItem.ERROR -> {
+                          r.pill.text = "EROARE"
+                          r.pill.setBackgroundResource(R.drawable.bg_pill_error)
+                          r.pill.setTextColor(getColor(R.color.error))
+                      }
+                      SongItem.SKIPPED -> {
+                          r.pill.text = "EXISTĂ"
+                          r.pill.setBackgroundResource(R.drawable.bg_pill_exists)
+                          r.pill.setTextColor(getColor(R.color.violet))
+                      }
+                      else -> {
+                          r.pill.text = "AȘTEAPTĂ"
+                          r.pill.setBackgroundResource(R.drawable.bg_pill_wait)
+                          r.pill.setTextColor(getColor(R.color.text2))
+                      }
+                  }
+              }
+
               private fun render() {
                   val items = JobState.items
                   val running = JobState.running
-                  convertBtn.text = if (running) "STOP" else "CONVERT"
-                  addBtn.visibility = if (running) View.VISIBLE else View.GONE
-                  if (JobState.message.isNotEmpty()) status.text = JobState.message
 
-                  if (!running && items.isEmpty()) {
-                      resultCard.visibility = View.GONE
-                      listCard.visibility = View.GONE
-                      return
-                  }
-                  resultCard.visibility = View.VISIBLE
-                  listCard.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
+                  mainBtn.text = if (running) "STOP" else "CONVERT"
+                  mainBtn.setCompoundDrawablesWithIntrinsicBounds(
+                      if (running) R.drawable.ic_stop else R.drawable.ic_download, 0, 0, 0
+                  )
+                  addBtn.visibility = if (running) View.VISIBLE else View.INVISIBLE
+                  if (JobState.message.isNotEmpty()) status.text = JobState.message
 
                   if (renderedFor !== items) {
                       songList.removeAllViews()
@@ -866,139 +1195,328 @@ jobs:
                       renderedFor = items
                       bigShownId = ""
                   }
-                  // Adaugă rânduri doar pentru melodiile noi (coada poate crește în timpul conversiei).
-                  while (rows.size < items.size) {
-                      val item = items[rows.size]
-                      val v = layoutInflater.inflate(R.layout.item_song, songList, false)
-                      v.findViewById<TextView>(R.id.rowTitle).text = item.title
-                      loadThumb("https://i.ytimg.com/vi/" + item.id + "/default.jpg", v.findViewById(R.id.rowThumb))
-                      rows.add(Row(v.findViewById(R.id.rowBar), v.findViewById(R.id.rowState)))
-                      songList.addView(v)
+                  while (rows.size < items.size) addRow(items[rows.size])
+
+                  var nAll = 0
+                  var nActive = 0
+                  var nDone = 0
+                  var nErr = 0
+                  val count = minOf(items.size, rows.size)
+                  for (i in 0 until count) {
+                      val item = items[i]
+                      val row = rows[i]
+                      val s = item.state
+                      val pct = item.percent
+                      if (s != SongItem.REMOVED) nAll++
+                      if (s == SongItem.DOWNLOADING || s == SongItem.CONVERTING) nActive++
+                      if (s == SongItem.DONE || s == SongItem.SKIPPED) nDone++
+                      if (s == SongItem.ERROR) nErr++
+
+                      if (s != row.lastState || pct != row.lastPct) {
+                          if (s != row.lastState) {
+                              row.fg.setBackgroundResource(
+                                  if (s == SongItem.DOWNLOADING || s == SongItem.CONVERTING)
+                                      R.drawable.bg_row_active else R.drawable.bg_row
+                              )
+                              row.retry.visibility = if (s == SongItem.ERROR) View.VISIBLE else View.GONE
+                          }
+                          stylePill(row, s, pct)
+                          val barValue = when (s) {
+                              SongItem.DOWNLOADING -> pct
+                              SongItem.CONVERTING, SongItem.DONE -> 100
+                              else -> 0
+                          }
+                          row.bar.setProgress(barValue, true)
+                          row.lastState = s
+                          row.lastPct = pct
+                      }
+                      row.root.visibility = if (matchesFilter(s)) View.VISIBLE else View.GONE
                   }
 
-                  for ((i, item) in items.withIndex()) {
-                      if (i >= rows.size) break
-                      val r = rows[i]
-                      when (item.state) {
-                          SongItem.DOWNLOADING -> {
-                              r.state.text = item.percent.toString() + "%"
-                              r.state.setTextColor(getColor(R.color.cyan))
-                              r.bar.progress = item.percent
-                          }
-                          SongItem.CONVERTING -> {
-                              r.state.text = "CONVERSIE"
-                              r.state.setTextColor(getColor(R.color.violet))
-                              r.bar.progress = 100
-                          }
-                          SongItem.DONE -> {
-                              r.state.text = "GATA"
-                              r.state.setTextColor(getColor(R.color.cyan))
-                              r.bar.progress = 100
-                          }
-                          SongItem.SKIPPED -> {
-                              r.state.text = "EXISTĂ"
-                              r.state.setTextColor(getColor(R.color.violet))
-                              r.bar.progress = 0
-                          }
-                          SongItem.ERROR -> {
-                              r.state.text = "EROARE"
-                              r.state.setTextColor(getColor(R.color.error))
-                              r.bar.progress = 0
-                          }
-                          else -> {
-                              r.state.text = "AȘTEAPTĂ"
-                              r.state.setTextColor(getColor(R.color.text2))
-                              r.bar.progress = 0
-                          }
-                      }
+                  val showHero = running || nAll > 0
+                  heroCard.visibility = if (showHero) View.VISIBLE else View.GONE
+                  tabsBar.visibility = if (showHero) View.VISIBLE else View.GONE
+                  emptyHint.visibility = if (showHero) View.GONE else View.VISIBLE
+                  retryAll.visibility = if (filter == 3 && nErr > 0) View.VISIBLE else View.GONE
+
+                  tabViews[0].text = "Toate " + nAll
+                  tabViews[1].text = "În curs " + nActive
+                  tabViews[2].text = "Gata " + nDone
+                  tabViews[3].text = "Erori " + nErr
+                  for ((i, t) in tabViews.withIndex()) {
+                      t.setBackgroundResource(if (i == filter) R.drawable.bg_tab_on else 0)
+                      t.setTextColor(getColor(if (i == filter) R.color.cyan else R.color.text2))
                   }
+
+                  parallelPill.visibility = if (running && nActive > 0) View.VISIBLE else View.GONE
+                  parallelPill.text = nActive.toString() + " PARALEL"
 
                   val cur = JobState.current
-                  if (cur in items.indices) {
+                  if (cur in 0 until count) {
                       val s = items[cur]
-                      songTitle.text = s.title
-                      val parallel = items.count {
-                          it.state == SongItem.DOWNLOADING || it.state == SongItem.CONVERTING
+                      val p = when (s.state) {
+                          SongItem.DOWNLOADING -> s.percent
+                          SongItem.CONVERTING, SongItem.DONE -> 100
+                          else -> 0
                       }
-                      songCounter.text = "MELODIA " + (cur + 1) + " / " + items.size +
-                          (if (parallel > 1) " · " + parallel + " ÎN PARALEL" else "")
+                      ring.setProgress(p)
+                      heroPercent.text = p.toString() + "%"
+                      songTitle.text = s.title
+                      songCounter.text = "MELODIA " + (cur + 1) + " / " + items.size
                       if (bigShownId != s.id) {
                           bigShownId = s.id
                           loadThumb("https://i.ytimg.com/vi/" + s.id + "/mqdefault.jpg", thumb)
                       }
                   } else if (running) {
+                      ring.setProgress(0)
+                      heroPercent.text = "0%"
                       songTitle.text = "Se citește lista..."
                       songCounter.text = ""
                   }
-                  val pct = JobState.overallPercent()
-                  progress.progress = pct
-                  overallText.text = pct.toString() + "%"
+                  val total = JobState.overallPercent()
+                  progress.setProgress(total, true)
+                  overallText.text = total.toString() + "%"
               }
           }
           EOF_8
-          mkdir -p "$(dirname "app/src/main/res/drawable/bg_btn_paste.xml")"
-          cat > "app/src/main/res/drawable/bg_btn_paste.xml" <<'EOF_9'
+          mkdir -p "$(dirname "app/src/main/java/com/example/ytmp3/RingProgressView.kt")"
+          cat > "app/src/main/java/com/example/ytmp3/RingProgressView.kt" <<'EOF_9'
+          package com.example.ytmp3
+
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.util.AttributeSet
+          import android.view.View
+
+          class RingProgressView @JvmOverloads constructor(
+              context: Context,
+              attrs: AttributeSet? = null
+          ) : View(context, attrs) {
+
+              private val density = resources.displayMetrics.density
+              private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = context.getColor(R.color.stroke)
+              }
+              private val arc = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeCap = Paint.Cap.ROUND
+                  color = context.getColor(R.color.cyan)
+              }
+              private val rect = RectF()
+              private var shown = 0f
+              private var target = -1
+              private var animator: ValueAnimator? = null
+
+              fun setProgress(p: Int) {
+                  val t = p.coerceIn(0, 100)
+                  if (t == target) return
+                  target = t
+                  animator?.cancel()
+                  val a = ValueAnimator.ofFloat(shown, t.toFloat())
+                  a.duration = 300
+                  a.addUpdateListener {
+                      shown = it.animatedValue as Float
+                      invalidate()
+                  }
+                  a.start()
+                  animator = a
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = 6f * density
+                  track.strokeWidth = w
+                  arc.strokeWidth = w
+                  val half = w / 2f
+                  rect.set(half, half, width - half, height - half)
+                  canvas.drawArc(rect, 0f, 360f, false, track)
+                  if (shown > 0f) {
+                      canvas.drawArc(rect, -90f, 360f * shown / 100f, false, arc)
+                  }
+              }
+          }
+          EOF_9
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_bar.xml")"
+          cat > "app/src/main/res/drawable/bg_bar.xml" <<'EOF_10'
           <?xml version="1.0" encoding="utf-8"?>
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-              <solid android:color="@android:color/transparent" />
-              <corners android:radius="8dp" />
-              <stroke android:width="1dp" android:color="@color/cyan" />
+              <solid android:color="@color/card" />
+              <corners android:radius="30dp" />
+              <stroke android:width="1dp" android:color="@color/stroke_input" />
           </shape>
-          EOF_9
+          EOF_10
           mkdir -p "$(dirname "app/src/main/res/drawable/bg_card.xml")"
-          cat > "app/src/main/res/drawable/bg_card.xml" <<'EOF_10'
+          cat > "app/src/main/res/drawable/bg_card.xml" <<'EOF_11'
           <?xml version="1.0" encoding="utf-8"?>
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
               <solid android:color="@color/card" />
               <corners android:radius="16dp" />
               <stroke android:width="1dp" android:color="@color/stroke" />
           </shape>
-          EOF_10
-          mkdir -p "$(dirname "app/src/main/res/drawable/bg_fab.xml")"
-          cat > "app/src/main/res/drawable/bg_fab.xml" <<'EOF_11'
-          <?xml version="1.0" encoding="utf-8"?>
-          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
-              <solid android:color="@color/card" />
-              <stroke android:width="1dp" android:color="@color/cyan" />
-          </shape>
           EOF_11
-          mkdir -p "$(dirname "app/src/main/res/drawable/bg_input.xml")"
-          cat > "app/src/main/res/drawable/bg_input.xml" <<'EOF_12'
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_chip_off.xml")"
+          cat > "app/src/main/res/drawable/bg_chip_off.xml" <<'EOF_12'
           <?xml version="1.0" encoding="utf-8"?>
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-              <solid android:color="@color/bg" />
-              <corners android:radius="12dp" />
+              <solid android:color="@android:color/transparent" />
+              <corners android:radius="16dp" />
               <stroke android:width="1dp" android:color="@color/stroke_input" />
           </shape>
           EOF_12
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_chip_on.xml")"
+          cat > "app/src/main/res/drawable/bg_chip_on.xml" <<'EOF_13'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/cyan_tint" />
+              <corners android:radius="16dp" />
+              <stroke android:width="1dp" android:color="@color/cyan" />
+          </shape>
+          EOF_13
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_circle_cyan.xml")"
+          cat > "app/src/main/res/drawable/bg_circle_cyan.xml" <<'EOF_14'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="@color/cyan" />
+          </shape>
+          EOF_14
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_circle_outline.xml")"
+          cat > "app/src/main/res/drawable/bg_circle_outline.xml" <<'EOF_15'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="@android:color/transparent" />
+              <stroke android:width="1dp" android:color="@color/cyan" />
+          </shape>
+          EOF_15
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_hero.xml")"
+          cat > "app/src/main/res/drawable/bg_hero.xml" <<'EOF_16'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/card" />
+              <corners android:radius="20dp" />
+              <stroke android:width="1dp" android:color="@color/stroke" />
+          </shape>
+          EOF_16
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_input_pill.xml")"
+          cat > "app/src/main/res/drawable/bg_input_pill.xml" <<'EOF_17'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/card" />
+              <corners android:radius="24dp" />
+              <stroke android:width="1dp" android:color="@color/stroke" />
+          </shape>
+          EOF_17
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_pill_active.xml")"
+          cat > "app/src/main/res/drawable/bg_pill_active.xml" <<'EOF_18'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@android:color/transparent" />
+              <corners android:radius="10dp" />
+              <stroke android:width="1dp" android:color="@color/cyan" />
+          </shape>
+          EOF_18
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_pill_done.xml")"
+          cat > "app/src/main/res/drawable/bg_pill_done.xml" <<'EOF_19'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/cyan_tint" />
+              <corners android:radius="10dp" />
+          </shape>
+          EOF_19
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_pill_error.xml")"
+          cat > "app/src/main/res/drawable/bg_pill_error.xml" <<'EOF_20'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/red_tint" />
+              <corners android:radius="10dp" />
+          </shape>
+          EOF_20
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_pill_exists.xml")"
+          cat > "app/src/main/res/drawable/bg_pill_exists.xml" <<'EOF_21'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/violet_tint" />
+              <corners android:radius="10dp" />
+          </shape>
+          EOF_21
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_pill_main.xml")"
+          cat > "app/src/main/res/drawable/bg_pill_main.xml" <<'EOF_22'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/cyan" />
+              <corners android:radius="22dp" />
+          </shape>
+          EOF_22
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_pill_wait.xml")"
+          cat > "app/src/main/res/drawable/bg_pill_wait.xml" <<'EOF_23'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/gray_tint" />
+              <corners android:radius="10dp" />
+          </shape>
+          EOF_23
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_row.xml")"
+          cat > "app/src/main/res/drawable/bg_row.xml" <<'EOF_24'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/card" />
+              <corners android:radius="14dp" />
+              <stroke android:width="1dp" android:color="@color/stroke" />
+          </shape>
+          EOF_24
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_row_active.xml")"
+          cat > "app/src/main/res/drawable/bg_row_active.xml" <<'EOF_25'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/card" />
+              <corners android:radius="14dp" />
+              <stroke android:width="1dp" android:color="@color/cyan" />
+          </shape>
+          EOF_25
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_segment.xml")"
+          cat > "app/src/main/res/drawable/bg_segment.xml" <<'EOF_26'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/card" />
+              <corners android:radius="12dp" />
+              <stroke android:width="1dp" android:color="@color/stroke" />
+          </shape>
+          EOF_26
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_swipe.xml")"
+          cat > "app/src/main/res/drawable/bg_swipe.xml" <<'EOF_27'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/red_tint" />
+              <corners android:radius="14dp" />
+          </shape>
+          EOF_27
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_tab_on.xml")"
+          cat > "app/src/main/res/drawable/bg_tab_on.xml" <<'EOF_28'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/cyan_tint" />
+              <corners android:radius="9dp" />
+          </shape>
+          EOF_28
           mkdir -p "$(dirname "app/src/main/res/drawable/bg_thumb.xml")"
-          cat > "app/src/main/res/drawable/bg_thumb.xml" <<'EOF_13'
+          cat > "app/src/main/res/drawable/bg_thumb.xml" <<'EOF_29'
           <?xml version="1.0" encoding="utf-8"?>
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
               <solid android:color="@color/stroke" />
               <corners android:radius="10dp" />
           </shape>
-          EOF_13
-          mkdir -p "$(dirname "app/src/main/res/drawable/btn_convert.xml")"
-          cat > "app/src/main/res/drawable/btn_convert.xml" <<'EOF_14'
+          EOF_29
+          mkdir -p "$(dirname "app/src/main/res/drawable/bg_thumb_circle.xml")"
+          cat > "app/src/main/res/drawable/bg_thumb_circle.xml" <<'EOF_30'
           <?xml version="1.0" encoding="utf-8"?>
-          <selector xmlns:android="http://schemas.android.com/apk/res/android">
-              <item android:state_enabled="false">
-                  <shape android:shape="rectangle">
-                      <solid android:color="#164E57" />
-                      <corners android:radius="14dp" />
-                  </shape>
-              </item>
-              <item>
-                  <shape android:shape="rectangle">
-                      <solid android:color="@color/cyan" />
-                      <corners android:radius="14dp" />
-                  </shape>
-              </item>
-          </selector>
-          EOF_14
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="@color/stroke" />
+          </shape>
+          EOF_30
           mkdir -p "$(dirname "app/src/main/res/drawable/ic_arrow_up.xml")"
-          cat > "app/src/main/res/drawable/ic_arrow_up.xml" <<'EOF_15'
+          cat > "app/src/main/res/drawable/ic_arrow_up.xml" <<'EOF_31'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="18dp"
@@ -1019,127 +1537,216 @@ jobs:
                   android:strokeLineJoin="round"
                   android:strokeWidth="2.4" />
           </vector>
-          EOF_15
+          EOF_31
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_bolt.xml")"
+          cat > "app/src/main/res/drawable/ic_bolt.xml" <<'EOF_32'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="14dp"
+              android:height="14dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#A78BFA"
+                  android:pathData="M13 2L4 14H11L10 22L20 9H13Z" />
+          </vector>
+          EOF_32
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_check_small.xml")"
+          cat > "app/src/main/res/drawable/ic_check_small.xml" <<'EOF_33'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="14dp"
+              android:height="14dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M5 12.5L10 17.5L19 7"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2.8" />
+          </vector>
+          EOF_33
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_clipboard.xml")"
+          cat > "app/src/main/res/drawable/ic_clipboard.xml" <<'EOF_34'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="20dp"
+              android:height="20dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M8 5H6a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2V7a2 2 0 0 0 -2 -2h-2"
+                  android:strokeColor="#04262B"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M9 3h6v4H9z"
+                  android:strokeColor="#04262B"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2" />
+          </vector>
+          EOF_34
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_close.xml")"
+          cat > "app/src/main/res/drawable/ic_close.xml" <<'EOF_35'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="18dp"
+              android:height="18dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M6 6L18 18 M18 6L6 18"
+                  android:strokeColor="#8A8F9A"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2.2" />
+          </vector>
+          EOF_35
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_download.xml")"
+          cat > "app/src/main/res/drawable/ic_download.xml" <<'EOF_36'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="18dp"
+              android:height="18dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M12 4V15 M7 10.5L12 15.5L17 10.5 M5 20H19"
+                  android:strokeColor="#04262B"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2.4" />
+          </vector>
+          EOF_36
           mkdir -p "$(dirname "app/src/main/res/drawable/ic_launcher_foreground.xml")"
-          cat > "app/src/main/res/drawable/ic_launcher_foreground.xml" <<'EOF_16'
+          cat > "app/src/main/res/drawable/ic_launcher_foreground.xml" <<'EOF_37'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
               android:height="108dp"
               android:viewportWidth="108"
               android:viewportHeight="108">
-              <path
-                  android:fillColor="#00000000"
-                  android:pathData="M54,30 L74.8,42 L74.8,66 L54,78 L33.2,66 L33.2,42 Z"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineJoin="round"
-                  android:strokeWidth="3" />
-              <path
-                  android:pathData="M43,52 L43,56"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M48.5,46.5 L48.5,61.5"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M54,41 L54,67"
-                  android:strokeColor="#A78BFA"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M59.5,46.5 L59.5,61.5"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
-              <path
-                  android:pathData="M65,52 L65,56"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="4" />
+              <group
+                  android:scaleX="0.55"
+                  android:scaleY="0.55"
+                  android:translateX="21"
+                  android:translateY="25.4">
+                  <path
+                      android:fillColor="#00000000"
+                      android:pathData="M52.36 8.67 A44 44 0 0 1 103.48 45.23 M101.35 67.05 A44 44 0 0 1 44.12 93.04 M26.29 80.28 A44 44 0 0 1 32.4 17.73"
+                      android:strokeColor="#22D3EE"
+                      android:strokeWidth="3.5" />
+                  <path
+                      android:fillColor="#00000000"
+                      android:pathData="M91.95 63.63 A34 34 0 0 1 57.55 85.91 M48.37 83.95 A34 34 0 0 1 26.09 49.55 M28.05 40.37 A34 34 0 0 1 62.45 18.09 M71.63 20.05 A34 34 0 0 1 93.91 54.45"
+                      android:strokeColor="#A78BFA"
+                      android:strokeWidth="1.4" />
+                  <path
+                      android:fillColor="#22D3EE"
+                      android:pathData="M39 72 L42 66 L50 64 L55 67 L52 73 L44 75 Z M61 68 L64 62 L72 60 L77 63 L74 69 L66 71 Z M52 38 h3.5 v30 h-3.5 z M74.5 32 h3.5 v33 h-3.5 z" />
+                  <path
+                      android:fillColor="#A78BFA"
+                      android:pathData="M52 38 L78 32 L78 40 L52 46 Z" />
+                  <path
+                      android:fillColor="#A78BFA"
+                      android:pathData="M9 42 h2.6 v20 h-2.6 z M108.4 42 h2.6 v20 h-2.6 z" />
+                  <path
+                      android:fillColor="#22D3EE"
+                      android:pathData="M4 47 h2.6 v10 h-2.6 z M113.4 47 h2.6 v10 h-2.6 z" />
+              </group>
           </vector>
-          EOF_16
-          mkdir -p "$(dirname "app/src/main/res/drawable/ic_logo_mark.xml")"
-          cat > "app/src/main/res/drawable/ic_logo_mark.xml" <<'EOF_17'
+          EOF_37
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_link.xml")"
+          cat > "app/src/main/res/drawable/ic_link.xml" <<'EOF_38'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="40dp"
-              android:height="40dp"
-              android:viewportWidth="96"
-              android:viewportHeight="96">
-              <path
-                  android:fillColor="#00000000"
-                  android:pathData="M48,10 L82,29 L82,67 L48,86 L14,67 L14,29 Z"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineJoin="round"
-                  android:strokeWidth="5" />
-              <path
-                  android:pathData="M32.5,45 L32.5,51"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-              <path
-                  android:pathData="M42.5,38 L42.5,58"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-              <path
-                  android:pathData="M52.5,30 L52.5,66"
-                  android:strokeColor="#A78BFA"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-              <path
-                  android:pathData="M62.5,38 L62.5,58"
-                  android:strokeColor="#22D3EE"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="7" />
-          </vector>
-          EOF_17
-          mkdir -p "$(dirname "app/src/main/res/drawable/ic_notif.xml")"
-          cat > "app/src/main/res/drawable/ic_notif.xml" <<'EOF_18'
-          <?xml version="1.0" encoding="utf-8"?>
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="24dp"
-              android:height="24dp"
+              android:width="18dp"
+              android:height="18dp"
               android:viewportWidth="24"
               android:viewportHeight="24">
               <path
                   android:fillColor="#00000000"
-                  android:pathData="M12,3 L19.8,7.5 L19.8,16.5 L12,21 L4.2,16.5 L4.2,7.5 Z"
-                  android:strokeColor="#FFFFFF"
+                  android:pathData="M10 14a3.5 3.5 0 0 0 5 0l3 -3a3.5 3.5 0 0 0 -5 -5l-0.5 0.5 M14 10a3.5 3.5 0 0 0 -5 0l-3 3a3.5 3.5 0 0 0 5 5l0.5 -0.5"
+                  android:strokeColor="#6B7280"
+                  android:strokeLineCap="round"
                   android:strokeLineJoin="round"
-                  android:strokeWidth="1.6" />
-              <path
-                  android:pathData="M8.6,11.2 L8.6,12.8"
-                  android:strokeColor="#FFFFFF"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="1.2" />
-              <path
-                  android:pathData="M10.3,9.6 L10.3,14.4"
-                  android:strokeColor="#FFFFFF"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="1.2" />
-              <path
-                  android:pathData="M12,8 L12,16"
-                  android:strokeColor="#FFFFFF"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="1.2" />
-              <path
-                  android:pathData="M13.7,9.6 L13.7,14.4"
-                  android:strokeColor="#FFFFFF"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="1.2" />
-              <path
-                  android:pathData="M15.4,11.2 L15.4,12.8"
-                  android:strokeColor="#FFFFFF"
-                  android:strokeLineCap="round"
-                  android:strokeWidth="1.2" />
+                  android:strokeWidth="2" />
           </vector>
-          EOF_18
+          EOF_38
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_logo_mark.xml")"
+          cat > "app/src/main/res/drawable/ic_logo_mark.xml" <<'EOF_39'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="44dp"
+              android:height="38dp"
+              android:viewportWidth="120"
+              android:viewportHeight="104">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M52.36 8.67 A44 44 0 0 1 103.48 45.23 M101.35 67.05 A44 44 0 0 1 44.12 93.04 M26.29 80.28 A44 44 0 0 1 32.4 17.73"
+                  android:strokeColor="#22D3EE"
+                  android:strokeWidth="3.5" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M91.95 63.63 A34 34 0 0 1 57.55 85.91 M48.37 83.95 A34 34 0 0 1 26.09 49.55 M28.05 40.37 A34 34 0 0 1 62.45 18.09 M71.63 20.05 A34 34 0 0 1 93.91 54.45"
+                  android:strokeColor="#A78BFA"
+                  android:strokeWidth="1.4" />
+              <path
+                  android:fillColor="#22D3EE"
+                  android:pathData="M39 72 L42 66 L50 64 L55 67 L52 73 L44 75 Z M61 68 L64 62 L72 60 L77 63 L74 69 L66 71 Z M52 38 h3.5 v30 h-3.5 z M74.5 32 h3.5 v33 h-3.5 z" />
+              <path
+                  android:fillColor="#A78BFA"
+                  android:pathData="M52 38 L78 32 L78 40 L52 46 Z" />
+              <path
+                  android:fillColor="#A78BFA"
+                  android:pathData="M9 42 h2.6 v20 h-2.6 z M108.4 42 h2.6 v20 h-2.6 z" />
+              <path
+                  android:fillColor="#22D3EE"
+                  android:pathData="M4 47 h2.6 v10 h-2.6 z M113.4 47 h2.6 v10 h-2.6 z" />
+          </vector>
+          EOF_39
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_notif.xml")"
+          cat > "app/src/main/res/drawable/ic_notif.xml" <<'EOF_40'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="120"
+              android:viewportHeight="120">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M52.36 8.67 A44 44 0 0 1 103.48 45.23 M101.35 67.05 A44 44 0 0 1 44.12 93.04 M26.29 80.28 A44 44 0 0 1 32.4 17.73"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="3.5" />
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M91.95 63.63 A34 34 0 0 1 57.55 85.91 M48.37 83.95 A34 34 0 0 1 26.09 49.55 M28.05 40.37 A34 34 0 0 1 62.45 18.09 M71.63 20.05 A34 34 0 0 1 93.91 54.45"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="1.4" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M39 72 L42 66 L50 64 L55 67 L52 73 L44 75 Z M61 68 L64 62 L72 60 L77 63 L74 69 L66 71 Z M52 38 h3.5 v30 h-3.5 z M74.5 32 h3.5 v33 h-3.5 z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M52 38 L78 32 L78 40 L52 46 Z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M9 42 h2.6 v20 h-2.6 z M108.4 42 h2.6 v20 h-2.6 z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M4 47 h2.6 v10 h-2.6 z M113.4 47 h2.6 v10 h-2.6 z" />
+          </vector>
+          EOF_40
           mkdir -p "$(dirname "app/src/main/res/drawable/ic_play.xml")"
-          cat > "app/src/main/res/drawable/ic_play.xml" <<'EOF_19'
+          cat > "app/src/main/res/drawable/ic_play.xml" <<'EOF_41'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="24dp"
@@ -1150,9 +1757,115 @@ jobs:
                   android:fillColor="#A78BFA"
                   android:pathData="M8,5 L8,19 L19,12 Z" />
           </vector>
-          EOF_19
+          EOF_41
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_plus.xml")"
+          cat > "app/src/main/res/drawable/ic_plus.xml" <<'EOF_42'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="20dp"
+              android:height="20dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M12 5V19 M5 12H19"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2.4" />
+          </vector>
+          EOF_42
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_refresh.xml")"
+          cat > "app/src/main/res/drawable/ic_refresh.xml" <<'EOF_43'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="20dp"
+              android:height="20dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M20 11A8 8 0 0 0 5.5 7.5 M4 4V8H8 M4 13A8 8 0 0 0 18.5 16.5 M20 20V16H16"
+                  android:strokeColor="#22D3EE"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2" />
+          </vector>
+          EOF_43
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_stop.xml")"
+          cat > "app/src/main/res/drawable/ic_stop.xml" <<'EOF_44'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="16dp"
+              android:height="16dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#04262B"
+                  android:pathData="M6 6H18V18H6Z" />
+          </vector>
+          EOF_44
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_trash.xml")"
+          cat > "app/src/main/res/drawable/ic_trash.xml" <<'EOF_45'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="20dp"
+              android:height="20dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:pathData="M4 7H20 M10 11V17 M14 11V17 M5 7L6 19a2 2 0 0 0 2 2H16a2 2 0 0 0 2 -2L19 7 M9 7V4H15V7"
+                  android:strokeColor="#F87171"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:strokeWidth="2" />
+          </vector>
+          EOF_45
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_word_conv.xml")"
+          cat > "app/src/main/res/drawable/ic_word_conv.xml" <<'EOF_46'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="120dp"
+              android:height="14dp"
+              android:viewportWidth="101"
+              android:viewportHeight="12">
+              <group
+                  android:translateX="2"
+                  android:translateY="2">
+                  <path
+                      android:fillColor="#00000000"
+                      android:pathData="M0 0 L2.4 3.6 L4.8 0 M2.4 3.6 L2.4 8 M7.36 0 L12.16 0 M9.76 0 L9.76 8 M14.72 1.2 L15.92 0 L18.32 0 L19.52 1.2 L19.52 3.2 L14.72 8 L19.52 8 M22.08 8 L22.08 0 L24.48 3.2 L26.88 0 L26.88 8 M29.44 8 L29.44 0 L33.44 0 L34.24 0.8 L34.24 3.2 L33.44 4 L29.44 4 M36.8 0 L41.6 0 L41.6 8 L36.8 8 M38.8 4 L41.6 4 M52.16 0 L48.16 0 L47.36 0.8 L47.36 7.2 L48.16 8 L52.16 8 M55.52 0 L58.72 0 L59.52 0.8 L59.52 7.2 L58.72 8 L55.52 8 L54.72 7.2 L54.72 0.8 L55.52 0 M62.08 8 L62.08 0 L66.88 8 L66.88 0 M69.44 0 L71.84 8 L74.24 0 M81.6 0 L76.8 0 L76.8 8 L81.6 8 M76.8 4 L80 4 M84.16 8 L84.16 0 L88.16 0 L88.96 0.8 L88.96 3.2 L88.16 4 L84.16 4 M86.56 4 L88.96 8 M91.52 0 L96.32 0 M93.92 0 L93.92 8"
+                      android:strokeColor="#22D3EE"
+                      android:strokeLineJoin="miter"
+                      android:strokeMiterLimit="2"
+                      android:strokeWidth="1.52" />
+              </group>
+          </vector>
+          EOF_46
+          mkdir -p "$(dirname "app/src/main/res/drawable/ic_word_tdg.xml")"
+          cat > "app/src/main/res/drawable/ic_word_tdg.xml" <<'EOF_47'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="54dp"
+              android:height="25dp"
+              android:viewportWidth="41"
+              android:viewportHeight="19">
+              <group
+                  android:translateX="2"
+                  android:translateY="2">
+                  <path
+                      android:fillColor="#00000000"
+                      android:pathData="M0 0 L9 0 M4.5 0 L4.5 15 M13.8 0 L19.8 0 L22.8 3 L22.8 12 L19.8 15 L13.8 15 L13.8 0 M36.6 2.25 L34.35 0 L29.85 0 L27.6 2.25 L27.6 12.75 L29.85 15 L34.35 15 L36.6 12.75 L36.6 7.5 L32.1 7.5"
+                      android:strokeColor="#F2F3F5"
+                      android:strokeLineJoin="miter"
+                      android:strokeMiterLimit="2"
+                      android:strokeWidth="2.85" />
+              </group>
+          </vector>
+          EOF_47
           mkdir -p "$(dirname "app/src/main/res/drawable/progress_bar.xml")"
-          cat > "app/src/main/res/drawable/progress_bar.xml" <<'EOF_20'
+          cat > "app/src/main/res/drawable/progress_bar.xml" <<'EOF_48'
           <?xml version="1.0" encoding="utf-8"?>
           <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
               <item android:id="@android:id/background">
@@ -1170,223 +1883,30 @@ jobs:
                   </clip>
               </item>
           </layer-list>
-          EOF_20
+          EOF_48
           mkdir -p "$(dirname "app/src/main/res/layout/activity_main.xml")"
-          cat > "app/src/main/res/layout/activity_main.xml" <<'EOF_21'
+          cat > "app/src/main/res/layout/activity_main.xml" <<'EOF_49'
           <?xml version="1.0" encoding="utf-8"?>
           <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="match_parent"
               android:layout_height="match_parent"
               android:background="@color/bg">
 
-          <ScrollView
-              android:id="@+id/scroll"
-              android:layout_width="match_parent"
-              android:layout_height="match_parent"
-              android:background="@color/bg"
-              android:fillViewport="true">
-
-              <LinearLayout
+              <ScrollView
+                  android:id="@+id/scroll"
                   android:layout_width="match_parent"
-                  android:layout_height="wrap_content"
-                  android:orientation="vertical"
-                  android:padding="20dp">
+                  android:layout_height="match_parent"
+                  android:background="@color/bg"
+                  android:fillViewport="true">
 
                   <LinearLayout
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:layout_marginTop="8dp"
-                      android:gravity="center_vertical"
-                      android:orientation="horizontal">
-
-                      <ImageView
-                          android:layout_width="44dp"
-                          android:layout_height="44dp"
-                          android:contentDescription="Logo"
-                          android:src="@drawable/ic_logo_mark" />
-
-                      <LinearLayout
-                          android:layout_width="wrap_content"
-                          android:layout_height="wrap_content"
-                          android:layout_marginStart="12dp"
-                          android:orientation="vertical">
-
-                          <TextView
-                              android:layout_width="wrap_content"
-                              android:layout_height="wrap_content"
-                              android:fontFamily="monospace"
-                              android:letterSpacing="0.25"
-                              android:text="TDG"
-                              android:textColor="@color/text"
-                              android:textSize="22sp"
-                              android:textStyle="bold" />
-
-                          <TextView
-                              android:layout_width="wrap_content"
-                              android:layout_height="wrap_content"
-                              android:layout_marginTop="2dp"
-                              android:fontFamily="monospace"
-                              android:letterSpacing="0.18"
-                              android:text="YT2MP3 CONVERT"
-                              android:textColor="@color/cyan"
-                              android:textSize="12sp" />
-                      </LinearLayout>
-                  </LinearLayout>
-
-                  <LinearLayout
-                      android:layout_width="match_parent"
-                      android:layout_height="2dp"
-                      android:layout_marginTop="16dp"
-                      android:orientation="horizontal">
-
-                      <View
-                          android:layout_width="0dp"
-                          android:layout_height="match_parent"
-                          android:layout_weight="1"
-                          android:background="@color/cyan" />
-
-                      <View
-                          android:layout_width="28dp"
-                          android:layout_height="match_parent"
-                          android:layout_marginStart="4dp"
-                          android:background="@color/violet" />
-
-                      <View
-                          android:layout_width="10dp"
-                          android:layout_height="match_parent"
-                          android:layout_marginStart="4dp"
-                          android:background="@color/stroke" />
-                  </LinearLayout>
-
-                  <LinearLayout
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="20dp"
-                      android:background="@drawable/bg_card"
                       android:orientation="vertical"
-                      android:padding="14dp">
-
-                      <EditText
-                          android:id="@+id/linkInput"
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content"
-                          android:background="@drawable/bg_input"
-                          android:fontFamily="monospace"
-                          android:gravity="top|start"
-                          android:hint="Linkuri YouTube (unul pe rând)"
-                          android:inputType="textMultiLine|textUri"
-                          android:maxLines="5"
-                          android:minHeight="48dp"
-                          android:padding="12dp"
-                          android:textColor="@color/text"
-                          android:textColorHint="@color/hint"
-                          android:textSize="13sp" />
-
-                      <LinearLayout
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content"
-                          android:layout_marginTop="10dp"
-                          android:orientation="horizontal">
-
-                          <Button
-                              android:id="@+id/pasteBtn"
-                              android:layout_width="0dp"
-                              android:layout_height="38dp"
-                              android:layout_weight="1"
-                              android:background="@drawable/bg_btn_paste"
-                              android:minHeight="0dp"
-                              android:text="PASTE"
-                              android:textColor="@color/cyan"
-                              android:textSize="12sp" />
-
-                          <Button
-                              android:id="@+id/clearBtn"
-                              android:layout_width="0dp"
-                              android:layout_height="38dp"
-                              android:layout_marginStart="8dp"
-                              android:layout_weight="1"
-                              android:background="@drawable/bg_btn_paste"
-                              android:minHeight="0dp"
-                              android:text="ȘTERGE"
-                              android:textColor="@color/violet"
-                              android:textSize="12sp" />
-                      </LinearLayout>
-
-                      <androidx.appcompat.widget.SwitchCompat
-                          android:id="@+id/playlistCheck"
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content"
-                          android:layout_marginTop="14dp"
-                          android:text="Descarcă tot playlist-ul"
-                          android:textColor="@color/text2"
-                          android:textSize="14sp" />
-
-                      <androidx.appcompat.widget.SwitchCompat
-                          android:id="@+id/skipCheck"
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content"
-                          android:layout_marginTop="10dp"
-                          android:checked="true"
-                          android:text="Sari peste melodiile deja descărcate"
-                          android:textColor="@color/text2"
-                          android:textSize="14sp" />
-
-                      <TextView
-                          android:id="@+id/workersLabel"
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content"
-                          android:layout_marginTop="14dp"
-                          android:text="Descărcări simultane: 3"
-                          android:textColor="@color/text2"
-                          android:textSize="14sp" />
-
-                      <SeekBar
-                          android:id="@+id/workersSeek"
-                          android:layout_width="match_parent"
-                          android:layout_height="wrap_content"
-                          android:layout_marginTop="4dp"
-                          android:max="3"
-                          android:progress="2"
-                          android:progressTint="@color/cyan"
-                          android:thumbTint="@color/cyan" />
-                  </LinearLayout>
-
-                  <Button
-                      android:id="@+id/convertBtn"
-                      android:layout_width="match_parent"
-                      android:layout_height="54dp"
-                      android:layout_marginTop="16dp"
-                      android:background="@drawable/btn_convert"
-                      android:fontFamily="monospace"
-                      android:letterSpacing="0.15"
-                      android:text="CONVERT"
-                      android:textColor="@color/on_cyan"
-                      android:textSize="15sp"
-                      android:textStyle="bold" />
-
-                  <Button
-                      android:id="@+id/addBtn"
-                      android:layout_width="match_parent"
-                      android:layout_height="46dp"
-                      android:layout_marginTop="10dp"
-                      android:background="@drawable/bg_btn_paste"
-                      android:fontFamily="monospace"
-                      android:letterSpacing="0.1"
-                      android:minHeight="0dp"
-                      android:text="+ ADAUGĂ ÎN COADĂ"
-                      android:textColor="@color/cyan"
-                      android:textSize="13sp"
-                      android:visibility="gone" />
-
-                  <LinearLayout
-                      android:id="@+id/resultCard"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="16dp"
-                      android:background="@drawable/bg_card"
-                      android:orientation="vertical"
-                      android:padding="14dp"
-                      android:visibility="gone">
+                      android:paddingStart="16dp"
+                      android:paddingTop="16dp"
+                      android:paddingEnd="16dp"
+                      android:paddingBottom="104dp">
 
                       <LinearLayout
                           android:layout_width="match_parent"
@@ -1395,14 +1915,10 @@ jobs:
                           android:orientation="horizontal">
 
                           <ImageView
-                              android:id="@+id/thumb"
-                              android:layout_width="96dp"
-                              android:layout_height="72dp"
-                              android:background="@drawable/bg_thumb"
-                              android:clipToOutline="true"
-                              android:contentDescription="Miniatură"
-                              android:scaleType="center"
-                              android:src="@drawable/ic_play" />
+                              android:layout_width="44dp"
+                              android:layout_height="38dp"
+                              android:contentDescription="Logo"
+                              android:src="@drawable/ic_logo_mark" />
 
                           <LinearLayout
                               android:layout_width="0dp"
@@ -1411,187 +1927,523 @@ jobs:
                               android:layout_weight="1"
                               android:orientation="vertical">
 
-                              <TextView
-                                  android:id="@+id/songTitle"
-                                  android:layout_width="match_parent"
-                                  android:layout_height="wrap_content"
-                                  android:ellipsize="end"
-                                  android:maxLines="3"
-                                  android:text="Se pregătește..."
-                                  android:textColor="@color/text"
-                                  android:textSize="14sp"
-                                  android:textStyle="bold" />
+                              <ImageView
+                                  android:layout_width="54dp"
+                                  android:layout_height="25dp"
+                                  android:contentDescription="TDG"
+                                  android:src="@drawable/ic_word_tdg" />
 
-                              <TextView
-                                  android:id="@+id/songCounter"
-                                  android:layout_width="wrap_content"
-                                  android:layout_height="wrap_content"
+                              <ImageView
+                                  android:layout_width="120dp"
+                                  android:layout_height="14dp"
                                   android:layout_marginTop="4dp"
-                                  android:fontFamily="monospace"
-                                  android:textColor="@color/text2"
-                                  android:textSize="11sp" />
+                                  android:contentDescription="YT2MP3 CONVERT"
+                                  android:src="@drawable/ic_word_conv" />
                           </LinearLayout>
+
+                          <TextView
+                              android:id="@+id/parallelPill"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:background="@drawable/bg_pill_exists"
+                              android:drawableStart="@drawable/ic_bolt"
+                              android:drawablePadding="4dp"
+                              android:fontFamily="monospace"
+                              android:gravity="center_vertical"
+                              android:paddingStart="8dp"
+                              android:paddingTop="4dp"
+                              android:paddingEnd="10dp"
+                              android:paddingBottom="4dp"
+                              android:text="0 PARALEL"
+                              android:textColor="@color/violet"
+                              android:textSize="10sp"
+                              android:visibility="gone" />
                       </LinearLayout>
 
                       <LinearLayout
                           android:layout_width="match_parent"
                           android:layout_height="wrap_content"
-                          android:layout_marginTop="14dp"
+                          android:layout_marginTop="18dp"
+                          android:background="@drawable/bg_input_pill"
                           android:gravity="center_vertical"
+                          android:minHeight="52dp"
+                          android:orientation="horizontal"
+                          android:paddingStart="14dp"
+                          android:paddingEnd="8dp">
+
+                          <ImageView
+                              android:layout_width="18dp"
+                              android:layout_height="18dp"
+                              android:contentDescription="Link"
+                              android:src="@drawable/ic_link" />
+
+                          <EditText
+                              android:id="@+id/linkInput"
+                              android:layout_width="0dp"
+                              android:layout_height="wrap_content"
+                              android:layout_marginStart="8dp"
+                              android:layout_weight="1"
+                              android:background="@null"
+                              android:fontFamily="monospace"
+                              android:hint="Lipește linkuri YouTube"
+                              android:inputType="textMultiLine|textUri"
+                              android:maxLines="3"
+                              android:paddingTop="10dp"
+                              android:paddingBottom="10dp"
+                              android:textColor="@color/text"
+                              android:textColorHint="@color/hint"
+                              android:textSize="13sp" />
+
+                          <ImageView
+                              android:id="@+id/clearBtn"
+                              android:layout_width="32dp"
+                              android:layout_height="32dp"
+                              android:contentDescription="Șterge"
+                              android:padding="7dp"
+                              android:src="@drawable/ic_close"
+                              android:visibility="gone" />
+
+                          <ImageView
+                              android:id="@+id/pasteBtn"
+                              android:layout_width="38dp"
+                              android:layout_height="38dp"
+                              android:background="@drawable/bg_circle_cyan"
+                              android:contentDescription="Lipește"
+                              android:padding="9dp"
+                              android:src="@drawable/ic_clipboard" />
+                      </LinearLayout>
+
+                      <LinearLayout
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="10dp"
                           android:orientation="horizontal">
+
+                          <TextView
+                              android:id="@+id/chipPlaylist"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:background="@drawable/bg_chip_off"
+                              android:drawablePadding="4dp"
+                              android:gravity="center_vertical"
+                              android:paddingStart="11dp"
+                              android:paddingTop="6dp"
+                              android:paddingEnd="11dp"
+                              android:paddingBottom="6dp"
+                              android:text="Playlist"
+                              android:textColor="@color/text2"
+                              android:textSize="12sp" />
+
+                          <TextView
+                              android:id="@+id/chipSkip"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:layout_marginStart="6dp"
+                              android:background="@drawable/bg_chip_off"
+                              android:drawablePadding="4dp"
+                              android:gravity="center_vertical"
+                              android:paddingStart="11dp"
+                              android:paddingTop="6dp"
+                              android:paddingEnd="11dp"
+                              android:paddingBottom="6dp"
+                              android:text="Sari existente"
+                              android:textColor="@color/text2"
+                              android:textSize="12sp" />
+
+                          <TextView
+                              android:id="@+id/chipWorkers"
+                              android:layout_width="wrap_content"
+                              android:layout_height="wrap_content"
+                              android:layout_marginStart="6dp"
+                              android:background="@drawable/bg_chip_off"
+                              android:gravity="center_vertical"
+                              android:paddingStart="11dp"
+                              android:paddingTop="6dp"
+                              android:paddingEnd="11dp"
+                              android:paddingBottom="6dp"
+                              android:text="Simultan ×3"
+                              android:textColor="@color/text2"
+                              android:textSize="12sp" />
+                      </LinearLayout>
+
+                      <TextView
+                          android:id="@+id/status"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="12dp"
+                          android:text="Se inițializează..."
+                          android:textColor="@color/text2"
+                          android:textSize="12sp" />
+
+                      <TextView
+                          android:id="@+id/emptyHint"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="24dp"
+                          android:background="@drawable/bg_hero"
+                          android:gravity="center"
+                          android:lineSpacingExtra="4dp"
+                          android:padding="24dp"
+                          android:text="Lipește unul sau mai multe linkuri și apasă CONVERT.\nPoți și să distribui linkul direct din aplicația YouTube."
+                          android:textColor="@color/text2"
+                          android:textSize="13sp" />
+
+                      <LinearLayout
+                          android:id="@+id/heroCard"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="12dp"
+                          android:background="@drawable/bg_hero"
+                          android:orientation="vertical"
+                          android:padding="14dp"
+                          android:visibility="gone">
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="wrap_content"
+                              android:gravity="center_vertical"
+                              android:orientation="horizontal">
+
+                              <FrameLayout
+                                  android:layout_width="84dp"
+                                  android:layout_height="84dp">
+
+                                  <com.example.ytmp3.RingProgressView
+                                      android:id="@+id/ring"
+                                      android:layout_width="match_parent"
+                                      android:layout_height="match_parent" />
+
+                                  <ImageView
+                                      android:id="@+id/thumb"
+                                      android:layout_width="58dp"
+                                      android:layout_height="58dp"
+                                      android:layout_gravity="center"
+                                      android:background="@drawable/bg_thumb_circle"
+                                      android:clipToOutline="true"
+                                      android:contentDescription="Miniatură"
+                                      android:scaleType="center"
+                                      android:src="@drawable/ic_play" />
+                              </FrameLayout>
+
+                              <LinearLayout
+                                  android:layout_width="0dp"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginStart="14dp"
+                                  android:layout_weight="1"
+                                  android:orientation="vertical">
+
+                                  <TextView
+                                      android:id="@+id/heroPercent"
+                                      android:layout_width="wrap_content"
+                                      android:layout_height="wrap_content"
+                                      android:fontFamily="monospace"
+                                      android:text="0%"
+                                      android:textColor="@color/cyan"
+                                      android:textSize="24sp"
+                                      android:textStyle="bold" />
+
+                                  <TextView
+                                      android:id="@+id/songTitle"
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:layout_marginTop="4dp"
+                                      android:ellipsize="end"
+                                      android:maxLines="2"
+                                      android:text="Se pregătește..."
+                                      android:textColor="@color/text"
+                                      android:textSize="14sp"
+                                      android:textStyle="bold" />
+
+                                  <TextView
+                                      android:id="@+id/songCounter"
+                                      android:layout_width="wrap_content"
+                                      android:layout_height="wrap_content"
+                                      android:layout_marginTop="2dp"
+                                      android:fontFamily="monospace"
+                                      android:textColor="@color/text2"
+                                      android:textSize="10sp" />
+                              </LinearLayout>
+                          </LinearLayout>
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="wrap_content"
+                              android:layout_marginTop="12dp"
+                              android:orientation="horizontal">
+
+                              <TextView
+                                  android:layout_width="0dp"
+                                  android:layout_height="wrap_content"
+                                  android:layout_weight="1"
+                                  android:fontFamily="monospace"
+                                  android:text="TOTAL"
+                                  android:textColor="@color/text2"
+                                  android:textSize="10sp" />
+
+                              <TextView
+                                  android:id="@+id/overallPercent"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:fontFamily="monospace"
+                                  android:text="0%"
+                                  android:textColor="@color/cyan"
+                                  android:textSize="10sp" />
+                          </LinearLayout>
 
                           <ProgressBar
                               android:id="@+id/progress"
                               style="?android:attr/progressBarStyleHorizontal"
-                              android:layout_width="0dp"
-                              android:layout_height="6dp"
-                              android:layout_weight="1"
+                              android:layout_width="match_parent"
+                              android:layout_height="5dp"
+                              android:layout_marginTop="4dp"
                               android:max="100"
                               android:progressDrawable="@drawable/progress_bar" />
+                      </LinearLayout>
+
+                      <LinearLayout
+                          android:id="@+id/tabsBar"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="12dp"
+                          android:background="@drawable/bg_segment"
+                          android:orientation="horizontal"
+                          android:padding="3dp"
+                          android:visibility="gone">
 
                           <TextView
-                              android:id="@+id/overallPercent"
-                              android:layout_width="wrap_content"
+                              android:id="@+id/tabAll"
+                              android:layout_width="0dp"
                               android:layout_height="wrap_content"
-                              android:layout_marginStart="10dp"
-                              android:fontFamily="monospace"
-                              android:text="0%"
+                              android:layout_weight="1"
+                              android:gravity="center"
+                              android:paddingTop="7dp"
+                              android:paddingBottom="7dp"
+                              android:text="Toate 0"
                               android:textColor="@color/cyan"
-                              android:textSize="13sp"
-                              android:textStyle="bold" />
-                      </LinearLayout>
-                  </LinearLayout>
+                              android:textSize="11sp" />
 
-                  <LinearLayout
-                      android:id="@+id/listCard"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="16dp"
-                      android:background="@drawable/bg_card"
-                      android:orientation="vertical"
-                      android:padding="14dp"
-                      android:visibility="gone">
+                          <TextView
+                              android:id="@+id/tabActive"
+                              android:layout_width="0dp"
+                              android:layout_height="wrap_content"
+                              android:layout_weight="1"
+                              android:gravity="center"
+                              android:paddingTop="7dp"
+                              android:paddingBottom="7dp"
+                              android:text="În curs 0"
+                              android:textColor="@color/text2"
+                              android:textSize="11sp" />
+
+                          <TextView
+                              android:id="@+id/tabDone"
+                              android:layout_width="0dp"
+                              android:layout_height="wrap_content"
+                              android:layout_weight="1"
+                              android:gravity="center"
+                              android:paddingTop="7dp"
+                              android:paddingBottom="7dp"
+                              android:text="Gata 0"
+                              android:textColor="@color/text2"
+                              android:textSize="11sp" />
+
+                          <TextView
+                              android:id="@+id/tabErrors"
+                              android:layout_width="0dp"
+                              android:layout_height="wrap_content"
+                              android:layout_weight="1"
+                              android:gravity="center"
+                              android:paddingTop="7dp"
+                              android:paddingBottom="7dp"
+                              android:text="Erori 0"
+                              android:textColor="@color/text2"
+                              android:textSize="11sp" />
+                      </LinearLayout>
 
                       <TextView
-                          android:layout_width="wrap_content"
+                          android:id="@+id/retryAll"
+                          android:layout_width="match_parent"
                           android:layout_height="wrap_content"
-                          android:fontFamily="monospace"
-                          android:letterSpacing="0.15"
-                          android:text="LISTA MELODII"
-                          android:textColor="@color/text2"
-                          android:textSize="11sp" />
+                          android:layout_marginTop="10dp"
+                          android:background="@drawable/bg_chip_on"
+                          android:gravity="center"
+                          android:paddingTop="9dp"
+                          android:paddingBottom="9dp"
+                          android:text="REÎNCEARCĂ TOATE ERORILE"
+                          android:textColor="@color/cyan"
+                          android:textSize="12sp"
+                          android:visibility="gone" />
 
                       <LinearLayout
                           android:id="@+id/songList"
                           android:layout_width="match_parent"
                           android:layout_height="wrap_content"
-                          android:layout_marginTop="6dp"
+                          android:layout_marginTop="10dp"
                           android:orientation="vertical" />
+                  </LinearLayout>
+              </ScrollView>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_gravity="bottom"
+                  android:layout_marginStart="12dp"
+                  android:layout_marginEnd="12dp"
+                  android:layout_marginBottom="14dp"
+                  android:background="@drawable/bg_bar"
+                  android:elevation="6dp"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal"
+                  android:padding="6dp">
+
+                  <ImageView
+                      android:id="@+id/topBtn"
+                      android:layout_width="44dp"
+                      android:layout_height="44dp"
+                      android:background="@drawable/bg_circle_outline"
+                      android:contentDescription="Sus"
+                      android:scaleType="center"
+                      android:src="@drawable/ic_arrow_up" />
+
+                  <TextView
+                      android:id="@+id/mainBtn"
+                      android:layout_width="0dp"
+                      android:layout_height="44dp"
+                      android:layout_marginStart="8dp"
+                      android:layout_marginEnd="8dp"
+                      android:layout_weight="1"
+                      android:background="@drawable/bg_pill_main"
+                      android:clickable="true"
+                      android:drawableStart="@drawable/ic_download"
+                      android:drawablePadding="8dp"
+                      android:focusable="true"
+                      android:fontFamily="monospace"
+                      android:gravity="center"
+                      android:letterSpacing="0.12"
+                      android:paddingStart="30dp"
+                      android:paddingEnd="30dp"
+                      android:text="CONVERT"
+                      android:textColor="@color/on_cyan"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <ImageView
+                      android:id="@+id/addBtn"
+                      android:layout_width="44dp"
+                      android:layout_height="44dp"
+                      android:background="@drawable/bg_circle_outline"
+                      android:contentDescription="Adaugă în coadă"
+                      android:scaleType="center"
+                      android:src="@drawable/ic_plus"
+                      android:visibility="invisible" />
+              </LinearLayout>
+          </FrameLayout>
+          EOF_49
+          mkdir -p "$(dirname "app/src/main/res/layout/item_song.xml")"
+          cat > "app/src/main/res/layout/item_song.xml" <<'EOF_50'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:layout_marginBottom="6dp"
+              android:background="@drawable/bg_swipe">
+
+              <ImageView
+                  android:layout_width="22dp"
+                  android:layout_height="22dp"
+                  android:layout_gravity="end|center_vertical"
+                  android:layout_marginEnd="22dp"
+                  android:contentDescription="Șterge din coadă"
+                  android:src="@drawable/ic_trash" />
+
+              <LinearLayout
+                  android:id="@+id/rowFg"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:background="@drawable/bg_row"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal"
+                  android:padding="8dp">
+
+                  <ImageView
+                      android:id="@+id/rowThumb"
+                      android:layout_width="48dp"
+                      android:layout_height="36dp"
+                      android:background="@drawable/bg_thumb"
+                      android:clipToOutline="true"
+                      android:contentDescription="Miniatură"
+                      android:scaleType="center"
+                      android:src="@drawable/ic_play" />
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="10dp"
+                      android:layout_marginEnd="8dp"
+                      android:layout_weight="1"
+                      android:orientation="vertical">
+
+                      <TextView
+                          android:id="@+id/rowTitle"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:ellipsize="end"
+                          android:maxLines="2"
+                          android:textColor="@color/text"
+                          android:textSize="12sp" />
+
+                      <ProgressBar
+                          android:id="@+id/rowBar"
+                          style="?android:attr/progressBarStyleHorizontal"
+                          android:layout_width="match_parent"
+                          android:layout_height="3dp"
+                          android:layout_marginTop="6dp"
+                          android:max="100"
+                          android:progressDrawable="@drawable/progress_bar" />
                   </LinearLayout>
 
                   <TextView
-                      android:id="@+id/status"
-                      android:layout_width="match_parent"
+                      android:id="@+id/rowPill"
+                      android:layout_width="wrap_content"
                       android:layout_height="wrap_content"
-                      android:layout_marginTop="16dp"
-                      android:gravity="center"
-                      android:text="Se inițializează..."
+                      android:background="@drawable/bg_pill_wait"
+                      android:fontFamily="monospace"
+                      android:paddingStart="8dp"
+                      android:paddingTop="3dp"
+                      android:paddingEnd="8dp"
+                      android:paddingBottom="3dp"
+                      android:text="AȘTEAPTĂ"
                       android:textColor="@color/text2"
-                      android:textSize="12sp" />
+                      android:textSize="10sp" />
+
+                  <ImageView
+                      android:id="@+id/rowRetry"
+                      android:layout_width="32dp"
+                      android:layout_height="32dp"
+                      android:contentDescription="Reîncearcă"
+                      android:padding="6dp"
+                      android:src="@drawable/ic_refresh"
+                      android:visibility="gone" />
               </LinearLayout>
-          </ScrollView>
-
-          <ImageButton
-              android:id="@+id/topBtn"
-              android:layout_width="40dp"
-              android:layout_height="40dp"
-              android:layout_gravity="bottom|start"
-              android:layout_marginStart="14dp"
-              android:layout_marginBottom="16dp"
-              android:background="@drawable/bg_fab"
-              android:contentDescription="Sus"
-              android:elevation="4dp"
-              android:scaleType="center"
-              android:src="@drawable/ic_arrow_up" />
-
           </FrameLayout>
-          EOF_21
-          mkdir -p "$(dirname "app/src/main/res/layout/item_song.xml")"
-          cat > "app/src/main/res/layout/item_song.xml" <<'EOF_22'
-          <?xml version="1.0" encoding="utf-8"?>
-          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent"
-              android:layout_height="wrap_content"
-              android:gravity="center_vertical"
-              android:orientation="horizontal"
-              android:paddingTop="6dp"
-              android:paddingBottom="6dp">
-
-              <ImageView
-                  android:id="@+id/rowThumb"
-                  android:layout_width="56dp"
-                  android:layout_height="42dp"
-                  android:background="@drawable/bg_thumb"
-                  android:clipToOutline="true"
-                  android:contentDescription="Miniatură"
-                  android:scaleType="center"
-                  android:src="@drawable/ic_play" />
-
-              <LinearLayout
-                  android:layout_width="0dp"
-                  android:layout_height="wrap_content"
-                  android:layout_marginStart="10dp"
-                  android:layout_marginEnd="8dp"
-                  android:layout_weight="1"
-                  android:orientation="vertical">
-
-                  <TextView
-                      android:id="@+id/rowTitle"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:ellipsize="end"
-                      android:maxLines="2"
-                      android:textColor="@color/text"
-                      android:textSize="13sp" />
-
-                  <ProgressBar
-                      android:id="@+id/rowBar"
-                      style="?android:attr/progressBarStyleHorizontal"
-                      android:layout_width="match_parent"
-                      android:layout_height="4dp"
-                      android:layout_marginTop="6dp"
-                      android:max="100"
-                      android:progressDrawable="@drawable/progress_bar" />
-              </LinearLayout>
-
-              <TextView
-                  android:id="@+id/rowState"
-                  android:layout_width="84dp"
-                  android:layout_height="wrap_content"
-                  android:fontFamily="monospace"
-                  android:gravity="end"
-                  android:textColor="@color/text2"
-                  android:textSize="11sp" />
-          </LinearLayout>
-          EOF_22
+          EOF_50
           mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml")"
-          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'EOF_23'
+          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'EOF_51'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/icon_bg" />
               <foreground android:drawable="@drawable/ic_launcher_foreground" />
           </adaptive-icon>
-          EOF_23
+          EOF_51
           mkdir -p "$(dirname "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml")"
-          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" <<'EOF_24'
+          cat > "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" <<'EOF_52'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/icon_bg" />
               <foreground android:drawable="@drawable/ic_launcher_foreground" />
           </adaptive-icon>
-          EOF_24
+          EOF_52
           mkdir -p "$(dirname "app/src/main/res/values/colors.xml")"
-          cat > "app/src/main/res/values/colors.xml" <<'EOF_25'
+          cat > "app/src/main/res/values/colors.xml" <<'EOF_53'
           <resources>
               <color name="bg">#0A0C10</color>
               <color name="card">#12151B</color>
@@ -1605,16 +2457,20 @@ jobs:
               <color name="error">#F87171</color>
               <color name="on_cyan">#04262B</color>
               <color name="icon_bg">#0A0C10</color>
+              <color name="cyan_tint">#2222D3EE</color>
+              <color name="violet_tint">#22A78BFA</color>
+              <color name="red_tint">#22F87171</color>
+              <color name="gray_tint">#228A8F9A</color>
           </resources>
-          EOF_25
+          EOF_53
           mkdir -p "$(dirname "app/src/main/res/values/strings.xml")"
-          cat > "app/src/main/res/values/strings.xml" <<'EOF_26'
+          cat > "app/src/main/res/values/strings.xml" <<'EOF_54'
           <resources>
               <string name="app_name">TDG YT2MP3 CONVERT</string>
           </resources>
-          EOF_26
+          EOF_54
           mkdir -p "$(dirname "app/src/main/res/values/themes.xml")"
-          cat > "app/src/main/res/values/themes.xml" <<'EOF_27'
+          cat > "app/src/main/res/values/themes.xml" <<'EOF_55'
           <resources>
               <style name="Theme.App" parent="Theme.AppCompat.NoActionBar">
                   <item name="colorPrimary">@color/cyan</item>
@@ -1629,7 +2485,7 @@ jobs:
                   <item name="android:textColorHint">@color/hint</item>
               </style>
           </resources>
-          EOF_27
+          EOF_55
 
       - uses: actions/setup-java@v4
         with:
